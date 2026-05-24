@@ -4,12 +4,13 @@ import json
 import cv2
 from transformers import AutoModelForCausalLM, AutoProcessor
 from tqdm import tqdm
+from src.utils.vlm_path import get_vlm_path
 
 def load_model():
     """
     Load VideoLLaMA3-7B model and processor.
     """
-    model_path = "DAMO-NLP-SG/VideoLLaMA3-7B"
+    model_path = get_vlm_path()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     float_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 

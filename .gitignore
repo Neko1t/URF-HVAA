@@ -24,6 +24,7 @@ data/
 *.safetensors
 # 大模型权重文件
 libs/llama/llama3.1-8b/
+libs/VideoLLaMA3-7B/
 
 # ========================
 # 3. 本地编辑器与环境配置

@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 from tqdm import tqdm
 import numpy as np
 import random
+from src.utils.vlm_path import get_vlm_path
 
 SEED = 3306
 torch.manual_seed(SEED)
@@ -18,7 +19,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 def load_model():
-    model_path = "DAMO-NLP-SG/VideoLLaMA3-7B"
+    model_path = get_vlm_path()
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
