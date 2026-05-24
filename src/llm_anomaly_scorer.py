@@ -10,6 +10,7 @@ from tqdm import tqdm
 from libs.llama.llama import Dialog, Llama
 from src.data.video_record import VideoRecord
 from src.utils.path_utils import find_unprocessed_videos
+from src.utils.torch_utils import ensure_single_gpu_distributed
 import torch
 import random
 
@@ -60,6 +61,7 @@ class LLMAnomalyScorer:
         self.max_gen_len = max_gen_len
         self.seed = seed
 
+        ensure_single_gpu_distributed()
         self.generator = Llama.build(
             ckpt_dir=self.ckpt_dir,
             tokenizer_path=self.tokenizer_path,

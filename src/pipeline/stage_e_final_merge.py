@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from libs.llama.llama import Llama
 from src.data.video_record import VideoRecord
+from src.utils.torch_utils import ensure_single_gpu_distributed
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,7 @@ def main() -> None:
     os.makedirs(metrics_dir, exist_ok=True)
 
     # Build LLM
+    ensure_single_gpu_distributed()
     generator = Llama.build(
         ckpt_dir=args.ckpt_dir,
         tokenizer_path=args.tokenizer_path,

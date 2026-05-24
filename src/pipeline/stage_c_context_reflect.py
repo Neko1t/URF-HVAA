@@ -26,6 +26,7 @@ from libs.llama.llama import Llama
 from src.data.video_record import VideoRecord
 from src.reflection.conflict_detector import ConflictDetector
 from src.reflection.context_memory import SlidingContextMemory
+from src.utils.torch_utils import ensure_single_gpu_distributed
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,7 @@ def main() -> None:
     os.makedirs(args.flagged_output, exist_ok=True)
 
     # Build LLM generator (single instance for both Phase 2 and Phase 3)
+    ensure_single_gpu_distributed()
     generator = Llama.build(
         ckpt_dir=args.ckpt_dir,
         tokenizer_path=args.tokenizer_path,
