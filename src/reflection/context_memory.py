@@ -143,8 +143,17 @@ class SlidingContextMemory:
 
         # Step 3 — generate context per window with drift gating
         contexts: List[SceneContext] = []
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None
 
-        for i, (start_sec, end_sec, window_captions) in enumerate(windows):
+        window_iter = _tqdm(windows, desc="    Phase 2: contexts", unit="win",
+                            leave=False, ncols=90) if _tqdm else windows
+        for i, (start_sec, end_sec, window_captions) in enumerate(window_iter):
+            if _tqdm and hasattr(window_iter, 'set_postfix_str'):
+                window_iter.set_postfix_str(f"[{start_sec:.0f}-{end_sec:.0f}s] {len(window_captions)} caps")
+
             # Drift check: skip if scene hasn't meaningfully changed
             if i > 0 and contexts:
                 if not self._has_scene_changed(window_captions, contexts[-1],
@@ -270,16 +279,46 @@ class SlidingContextMemory:
             return self._drift_check_llm(new_captions, prev_context, llm_generator)
 
     def _init_embedder(self) -> None:
-        """Lazy-load the sentence-transformers model (Plan A)."""
+        """Lazy-load the sentence-transformers model (Plan A).
+
+        Looks for a local copy at ``libs/embedder/`` first (downloadable via
+        ``python scripts/download_vlm.py --model embedder``), then falls back
+        to HuggingFace Hub.
+        """
         try:
             from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Plan A drift detection: all-MiniLM-L6-v2 loaded.")
         except ImportError:
             self._embedder_failed = True
             logger.warning(
                 "sentence-transformers not installed; "
                 "falling back to LLM-based drift detection (Plan B)."
+            )
+            return
+
+        # Try local copy first (offline-friendly).
+        # ModelScope's snapshot_download nests files under cache_dir/{org}/{model}/,
+        # so the actual model files live at libs/embedder/sentence-transformers/all-MiniLM-L6-v2/.
+        import os as _os
+        _root = _os.path.dirname(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        )
+        _candidates = [
+            _os.path.join(_root, "libs", "embedder",
+                          "sentence-transformers", "all-MiniLM-L6-v2"),
+            _os.path.join(_root, "libs", "embedder"),
+        ]
+        _local = next((p for p in _candidates if _os.path.isdir(p)), None)
+        model_path = _local if _local else "all-MiniLM-L6-v2"
+
+        try:
+            self._embedder = SentenceTransformer(model_path)
+            logger.info("Plan A drift detection: %s loaded.", model_path)
+        except Exception:
+            self._embedder_failed = True
+            logger.warning(
+                "sentence-transformers model unavailable (%s); "
+                "falling back to LLM-based drift detection (Plan B).",
+                model_path,
             )
 
     def _drift_check_embedding(

@@ -2,25 +2,29 @@
 
 import os
 
-# Project-relative preferred local path
-_LOCAL_VLM_DIR = os.path.join("libs", "VideoLLaMA3-7B")
 _HF_MODEL_ID = "DAMO-NLP-SG/VideoLLaMA3-7B"
 
 
 def get_vlm_path() -> str:
     """Return the path to use for loading the VLM.
 
-    If ``libs/VideoLLaMA3-7B/`` exists and contains model files, use it.
-    Otherwise fall back to the HuggingFace Hub model id (auto-download).
+    Searches common local paths (including ModelScope's nested
+    ``org/model_name/`` structure) before falling back to HF Hub.
     """
-    # Resolve relative to the project root (two levels up from this file)
     utils_dir = os.path.dirname(os.path.abspath(__file__))
-    src_dir = os.path.dirname(utils_dir)
-    project_root = os.path.dirname(src_dir)
-    local_path = os.path.join(project_root, _LOCAL_VLM_DIR)
+    project_root = os.path.dirname(os.path.dirname(utils_dir))
 
-    if os.path.isdir(local_path) and _has_model_files(local_path):
-        return local_path
+    candidates = [
+        os.path.join(project_root, "libs", "VideoLLaMA3-7B"),
+        # ModelScope snapshot_download nests under cache_dir/{org}/{model}/
+        os.path.join(project_root, "libs", "VideoLLaMA3-7B",
+                     "DAMO-NLP-SG", "VideoLLaMA3-7B"),
+    ]
+
+    for local_path in candidates:
+        if os.path.isdir(local_path) and _has_model_files(local_path):
+            return local_path
+
     return _HF_MODEL_ID
 
 

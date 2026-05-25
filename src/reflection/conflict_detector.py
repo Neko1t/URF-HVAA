@@ -28,6 +28,8 @@ import logging
 import re
 from typing import Dict, List, Optional
 
+import numpy as np
+
 from src.perception.vlm_engine import FlaggedFrame, SceneContext
 
 logger = logging.getLogger(__name__)
@@ -147,15 +149,20 @@ class ConflictDetector:
         self,
         cap_max_flags: int = 20,
         batch_size: int = 15,
+        min_score_percentile: float = 50.0,
     ):
         """
         Args:
             cap_max_flags: Maximum number of flagged frames to return.
                 Controls Phase 4 VLM cost.
             batch_size: Number of frame descriptions per LLM call.
+            min_score_percentile: Only keep flagged frames whose anomaly
+                score exceeds this percentile of **all** scores in the video
+                (0–100).  Default 50 = median.  Set to 0 to disable.
         """
         self.cap_max_flags = cap_max_flags
         self.batch_size = batch_size
+        self.min_score_percentile = min_score_percentile
 
     # -- public API ---------------------------------------------------------
 
@@ -206,17 +213,37 @@ class ConflictDetector:
             key = id(ctx)
             ctx_to_frames.setdefault(key, []).append(fidx)
 
+        total_batches = sum(
+            (len(frames) + self.batch_size - 1) // self.batch_size
+            for frames in ctx_to_frames.values()
+        )
+
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None
+
+        pbar = _tqdm(total=total_batches, desc="    Phase 3: conflicts",
+                      unit="batch", leave=False, ncols=90) if _tqdm else None
+        batch_num = 0
+
         for ctx_frames in ctx_to_frames.values():
-            # The context is the same for all frames in this group
             ctx = frame_ctx_map[ctx_frames[0]]
             ctx_frames.sort()
 
             for batch_start in range(0, len(ctx_frames), self.batch_size):
+                batch_num += 1
                 batch_frames = ctx_frames[batch_start:batch_start + self.batch_size]
                 flags = self._detect_batch(
                     llm_generator, ctx, batch_frames, captions,
                 )
                 all_flags.extend(flags)
+                if pbar:
+                    pbar.set_postfix_str(f"{len(all_flags)} conflicts")
+                    pbar.update(1)
+
+        if pbar:
+            pbar.close()
 
         if not all_flags:
             return []
@@ -236,7 +263,25 @@ class ConflictDetector:
             reverse=True,
         )
 
-        # Cap
+        # Filter by minimum score percentile (dynamic per-video threshold)
+        if self.min_score_percentile > 0:
+            all_vals = [float(v) for v in scores.values() if v is not None]
+            if all_vals:
+                score_threshold = float(
+                    np.percentile(all_vals, self.min_score_percentile)
+                )
+                n_before = len(unique_flags)
+                unique_flags = [
+                    f for f in unique_flags
+                    if float(scores.get(str(f["frame"]), 0.0)) > score_threshold
+                ]
+                logger.info(
+                    "Score gate (p%d=%.3f): %d → %d flagged",
+                    int(self.min_score_percentile), score_threshold,
+                    n_before, len(unique_flags),
+                )
+
+        # Safety cap (generous; score gate already controls quality)
         unique_flags = unique_flags[:self.cap_max_flags]
 
         # Convert to FlaggedFrame dataclasses
@@ -283,7 +328,7 @@ class ConflictDetector:
         try:
             results = llm_generator.chat_completion(
                 dialogs,
-                max_gen_len=512,
+                max_gen_len=1024,
                 temperature=0.1,
                 top_p=0.9,
             )
