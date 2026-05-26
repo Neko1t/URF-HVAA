@@ -24,7 +24,12 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 
-from src.perception.vlm_engine import FlaggedFrame, SceneContext, VLMEngine
+from src.perception.vlm_engine import (
+    AdversarialVerification,
+    FlaggedFrame,
+    SceneContext,
+    VLMEngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +189,68 @@ class TargetedVerifier:
 
         self.tracker.flagged_count = len(flagged_frames)
         return refined
+
+    def verify_frames_adversarial(
+        self,
+        vlm_engine: VLMEngine,
+        video_path: str,
+        flagged_frames: List[FlaggedFrame],
+        contexts: List[SceneContext],
+        fps: float,
+        mode: str = "fine",
+        progress: bool = False,
+    ) -> Dict[int, AdversarialVerification]:
+        """v2: Adversarial dual-perspective verification.
+
+        Runs TWO VLM passes per flagged frame (positive + negative perspective),
+        producing an AdversarialVerification with bidirectional tags + confidence.
+
+        Args:
+            vlm_engine: A loaded VLMEngine instance.
+            video_path: Path to the .mp4 file.
+            flagged_frames: FlaggedFrame list from Phase 3.
+            contexts: SceneContext list from Phase 2.
+            fps: Video frames per second.
+            mode: Sampling mode.
+            progress: Show per-frame tqdm progress bar.
+
+        Returns:
+            {frame_idx: AdversarialVerification}
+        """
+        results: Dict[int, AdversarialVerification] = {}
+        video_name = os.path.basename(video_path).replace(".mp4", "")
+
+        ff_iter = tqdm(flagged_frames, desc=f"  VLM advers. {video_name}",
+                       unit="frame", leave=False, ncols=100) if progress \
+                  else flagged_frames
+
+        for ff in ff_iter:
+            ctx = self._find_context(ff.frame, fps, contexts)
+            if ctx is None:
+                logger.debug("Frame %d: no SceneContext, skipping.", ff.frame)
+                continue
+
+            if progress:
+                ff_iter.set_postfix_str(f"f{ff.frame}")
+
+            try:
+                result = vlm_engine.adversarial_verify(
+                    video_path=video_path,
+                    frame_idx=ff.frame,
+                    scene_context=ctx,
+                    flagged_frame=ff,
+                    mode=mode,
+                )
+                if result is not None:
+                    results[ff.frame] = result
+                    self.tracker.phase4_vlm_calls += 2  # two VLM passes
+            except Exception:
+                logger.warning(
+                    "Adversarial verify failed for frame %d", ff.frame,
+                )
+
+        self.tracker.flagged_count = len(flagged_frames)
+        return results
 
     # -- Phase 4b: LLM rescore ----------------------------------------------
 

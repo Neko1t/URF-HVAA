@@ -20,7 +20,12 @@ from typing import Optional
 import cv2
 from tqdm import tqdm
 
-from src.perception.vlm_engine import FlaggedFrame, SceneContext, VLMEngine
+from src.perception.vlm_engine import (
+    AdversarialVerification,
+    FlaggedFrame,
+    SceneContext,
+    VLMEngine,
+)
 from src.reflection.targeted_verifier import ComputeTracker, TargetedVerifier
 
 
@@ -44,6 +49,8 @@ def parse_args() -> argparse.Namespace:
                    help="Root path for video frames (for VideoRecord)")
     p.add_argument("--mode", default="fine",
                    help="VLM sampling mode (default: fine)")
+    p.add_argument("--adversarial", action="store_true",
+                   help="v2: Use dual-perspective adversarial VLM verification")
     return p.parse_args()
 
 
@@ -79,6 +86,17 @@ def _load_contexts(path: str) -> list[SceneContext]:
     ]
 
 
+def _adversarial_to_dict(av: AdversarialVerification) -> dict:
+    return {
+        "frame": av.frame,
+        "caption_refined": av.caption_refined,
+        "positive_tag": av.positive_tag,
+        "positive_confidence": av.positive_confidence,
+        "negative_tag": av.negative_tag,
+        "negative_confidence": av.negative_confidence,
+    }
+
+
 def _get_video_meta(video_path: str) -> tuple[float, int]:
     """Return (fps, frame_count) from a single VideoCapture open."""
     cap = cv2.VideoCapture(video_path)
@@ -102,6 +120,7 @@ def run(
     output_dir: str,
     root_path: str,
     mode: str = "fine",
+    adversarial: bool = False,
     video_filter: Optional[list[str]] = None,
 ) -> None:
     """Stage D: targeted VLM verification (programmatic entry point).
@@ -162,23 +181,39 @@ def run(
 
         total_frames = video.num_frames if video.num_frames > 0 else total_frames_from_video
 
-        refined = verifier.verify_frames(
-            engine, video_path, flagged_frames, contexts, fps,
-            mode=mode, progress=True,
-        )
+        if adversarial:
+            refined = verifier.verify_frames_adversarial(
+                engine, video_path, flagged_frames, contexts, fps,
+                mode=mode, progress=True,
+            )
+            global_tracker.phase4_vlm_calls += verifier.tracker.phase4_vlm_calls
+            output_path = os.path.join(output_dir, f"{video_name}.json")
+            with open(output_path, "w") as f:
+                json.dump(
+                    {str(k): _adversarial_to_dict(v) for k, v in refined.items()},
+                    f, indent=2,
+                )
+            tqdm.write(
+                f"{video_name}: {len(refined)}/{len(flagged_frames)} "
+                f"adversarially verified"
+            )
+        else:
+            refined = verifier.verify_frames(
+                engine, video_path, flagged_frames, contexts, fps,
+                mode=mode, progress=True,
+            )
+            global_tracker.phase4_vlm_calls += verifier.tracker.phase4_vlm_calls
+            output_path = os.path.join(output_dir, f"{video_name}.json")
+            with open(output_path, "w") as f:
+                json.dump(refined, f, indent=2)
+            tqdm.write(
+                f"{video_name}: {len(refined)}/{len(flagged_frames)} "
+                f"frames verified"
+            )
 
         global_tracker.total_frames += total_frames
         global_tracker.phase1_vlm_calls += total_frames // 16
-        global_tracker.phase4_vlm_calls += verifier.tracker.phase4_vlm_calls
         global_tracker.flagged_count += len(flagged_frames)
-
-        output_path = os.path.join(output_dir, f"{video_name}.json")
-        with open(output_path, "w") as f:
-            json.dump(refined, f, indent=2)
-
-        tqdm.write(
-            f"{video_name}: {len(refined)}/{len(flagged_frames)} frames verified"
-        )
 
     engine.unload()
 
@@ -199,6 +234,7 @@ def main() -> None:
         output_dir=args.output_dir,
         root_path=args.root_path,
         mode=args.mode,
+        adversarial=args.adversarial,
     )
 
 

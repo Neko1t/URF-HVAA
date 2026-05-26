@@ -50,6 +50,21 @@ class SceneContext:
     description: str
 
 
+@dataclass
+class AdversarialVerification:
+    """Output of v2 adversarial dual-perspective VLM verification.
+
+    Carries both the positive (anomaly) and negative (normal) interpretations
+    with their VLM-reported confidence scores.
+    """
+    frame: int
+    caption_refined: str          # factual description (positive perspective)
+    positive_tag: str              # suspected anomalous behavior
+    positive_confidence: float     # 0-1, VLM's self-reported confidence
+    negative_tag: str              # plausible normal explanation
+    negative_confidence: float     # 0-1, VLM's self-reported confidence
+
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -74,6 +89,43 @@ GUIDED_SYSTEM_PROMPT = (
 
 GUIDED_USER_PROMPT = (
     "Please describe this video segment objectively."
+)
+
+# -- v2 adversarial dual-perspective prompts --
+
+ADVERSARIAL_POSITIVE_SYSTEM = (
+    "You are an objective visual observer. Describe what you ACTUALLY SEE "
+    "in this video segment — not what you expect to see. Do not speculate.\n\n"
+    "SCENE CONTEXT: {scene_context}\n\n"
+    "IMPORTANT: A previous coarse scan flagged potential \"{suspicious_element}\" "
+    "because {conflict_reason}. However, this may be INACCURATE.\n\n"
+    "Please examine the frames carefully and answer:\n"
+    "1. What is actually visible? Describe only observable facts.\n"
+    "2. Is there genuinely any suspicious or anomalous activity?\n"
+    "3. On a scale of 0-100, how confident are you that the described "
+    "activity is genuinely anomalous (not just unusual but benign)?\n\n"
+    "Respond in this exact format (no extra text):\n"
+    "DESCRIPTION: <factual description>\n"
+    "SUSPICIOUS_TAG: <brief tag or 'none'>\n"
+    "CONFIDENCE: <0-100 integer>"
+)
+
+ADVERSARIAL_NEGATIVE_SYSTEM = (
+    "You are an objective visual observer. Your task is to find innocent "
+    "explanations for events that might initially seem suspicious.\n\n"
+    "SCENE CONTEXT: {scene_context}\n\n"
+    "A previous analysis described: \"{positive_tag}\" with confidence "
+    "{positive_confidence}.\n\n"
+    "Please examine the same segment and argue why this could be a NORMAL, "
+    "non-suspicious situation:\n"
+    "1. What innocent explanations exist for what is seen?\n"
+    "2. Could this be a normal interaction, accident, or misunderstanding?\n"
+    "3. On a scale of 0-100, how confident are you that this is a NORMAL "
+    "(non-criminal) situation?\n\n"
+    "Respond in this exact format (no extra text):\n"
+    "NORMAL_EXPLANATION: <innocent explanation>\n"
+    "NORMAL_TAG: <brief normal label>\n"
+    "CONFIDENCE: <0-100 integer>"
 )
 
 
@@ -246,6 +298,187 @@ class VLMEngine:
         )
         response = self._infer(conversation)
         return response if response.strip() else "No detected activity."
+
+    def adversarial_verify(
+        self,
+        video_path: str,
+        frame_idx: int,
+        scene_context: SceneContext,
+        flagged_frame: FlaggedFrame,
+        mode: str = "fine",
+        interval: Optional[int] = None,
+    ) -> Optional[AdversarialVerification]:
+        """v2: Dual-perspective adversarial verification.
+
+        Runs TWO VLM passes on the same segment:
+          1. Positive pass — what anomalous activity might exist?
+          2. Negative pass — why could this be a normal situation?
+
+        Together they produce a balanced signal for Stage E's bidirectional
+        tag anchoring, reducing the risk of LLM blindly trusting a single tag.
+
+        Args:
+            video_path: Path to the .mp4 file.
+            frame_idx: Center frame index for the segment.
+            scene_context: SceneContext from Phase 2.
+            flagged_frame: Flagged frame data from Phase 3.
+            mode: 'coarse' or 'fine' (default 'fine').
+            interval: Explicit time window half-width in seconds.
+
+        Returns:
+            AdversarialVerification or None if VLM fails.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("VLMEngine.load() must be called before inference.")
+
+        if not os.path.exists(video_path):
+            return None
+
+        total_duration, fps, total_frames = self._get_video_info(video_path)
+        if total_duration <= 0 or fps <= 0:
+            return None
+
+        # Resolve sampling parameters
+        if interval is None:
+            interval = 2.5 if mode == "fine" else 5
+        max_frames = 16 if mode == "fine" else 8
+
+        center_sec = frame_idx / fps
+        start_sec = max(0.0, center_sec - interval)
+        end_sec = min(total_duration, center_sec + interval)
+
+        if end_sec - start_sec <= 0:
+            return None
+
+        # ---- Pass 1: positive (anomaly-focused) ----
+        pos_conv = self._build_adversarial_positive_conversation(
+            video_path, start_sec, end_sec, max_frames,
+            scene_context, flagged_frame,
+        )
+        pos_response = self._infer(pos_conv, temperature=0.1)
+        pos_parsed = self._parse_adversarial_response(pos_response, mode="positive")
+
+        # ---- Pass 2: negative (normal-explanation-focused) ----
+        pos_tag = pos_parsed.get("tag", flagged_frame.suspicious_element)
+        pos_conf = pos_parsed.get("confidence", 50)
+
+        neg_conv = self._build_adversarial_negative_conversation(
+            video_path, start_sec, end_sec, max_frames,
+            scene_context, pos_tag, pos_conf,
+        )
+        neg_response = self._infer(neg_conv, temperature=0.1)
+        neg_parsed = self._parse_adversarial_response(neg_response, mode="negative")
+
+        return AdversarialVerification(
+            frame=frame_idx,
+            caption_refined=pos_parsed.get("description",
+                                           flagged_frame.caption_summary),
+            positive_tag=pos_tag,
+            positive_confidence=float(pos_conf) / 100.0,
+            negative_tag=neg_parsed.get("tag", "normal interaction"),
+            negative_confidence=float(neg_parsed.get("confidence", 50)) / 100.0,
+        )
+
+    # -- internal conversation builders (v2) ----------------------------------
+
+    def _build_adversarial_positive_conversation(
+        self,
+        video_path: str,
+        start_sec: float,
+        end_sec: float,
+        max_frames: int,
+        scene_context: SceneContext,
+        flagged: FlaggedFrame,
+    ) -> list[dict]:
+        system = ADVERSARIAL_POSITIVE_SYSTEM.format(
+            scene_context=scene_context.description,
+            suspicious_element=flagged.suspicious_element,
+            conflict_reason=flagged.conflict_reason,
+        )
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": {
+                            "video_path": video_path,
+                            "fps": 2,
+                            "start_time": start_sec,
+                            "end_time": end_sec,
+                            "max_frames": max_frames,
+                        },
+                    },
+                    {"type": "text", "text": "Describe what you see."},
+                ],
+            },
+        ]
+
+    def _build_adversarial_negative_conversation(
+        self,
+        video_path: str,
+        start_sec: float,
+        end_sec: float,
+        max_frames: int,
+        scene_context: SceneContext,
+        positive_tag: str,
+        positive_confidence: float,
+    ) -> list[dict]:
+        system = ADVERSARIAL_NEGATIVE_SYSTEM.format(
+            scene_context=scene_context.description,
+            positive_tag=positive_tag,
+            positive_confidence=int(positive_confidence),
+        )
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": {
+                            "video_path": video_path,
+                            "fps": 2,
+                            "start_time": start_sec,
+                            "end_time": end_sec,
+                            "max_frames": max_frames,
+                        },
+                    },
+                    {"type": "text", "text": "Argue why this could be normal."},
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _parse_adversarial_response(response: str, mode: str = "positive") -> dict:
+        import re as _re
+        result: dict = {"description": "", "tag": "", "confidence": 50}
+        if not response:
+            return result
+        if mode == "positive":
+            desc_m = _re.search(r"DESCRIPTION:\s*(.+?)(?:\n\S+:|\Z)", response, _re.S)
+            tag_m = _re.search(r"SUSPICIOUS_TAG:\s*(.+?)(?:\n\S+:|\Z)", response, _re.S)
+            conf_m = _re.search(r"CONFIDENCE:\s*(\d+)", response)
+            if desc_m:
+                result["description"] = desc_m.group(1).strip()
+            if tag_m:
+                tag = tag_m.group(1).strip()
+                if tag.lower() != "none":
+                    result["tag"] = tag
+            if conf_m:
+                result["confidence"] = int(conf_m.group(1))
+        else:
+            desc_m = _re.search(r"NORMAL_EXPLANATION:\s*(.+?)(?:\n\S+:|\Z)", response, _re.S)
+            tag_m = _re.search(r"NORMAL_TAG:\s*(.+?)(?:\n\S+:|\Z)", response, _re.S)
+            conf_m = _re.search(r"CONFIDENCE:\s*(\d+)", response)
+            if desc_m:
+                result["description"] = desc_m.group(1).strip()
+            if tag_m:
+                result["tag"] = tag_m.group(1).strip()
+            if conf_m:
+                result["confidence"] = int(conf_m.group(1))
+        return result
 
     # -- internal helpers ---------------------------------------------------
 

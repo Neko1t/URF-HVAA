@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
                         "(default: 30.0 for UCF-Crime)")
     p.add_argument("--max_seq_len", type=int, default=4096)
     p.add_argument("--max_gen_len", type=int, default=2048)
+    p.add_argument("--detection_mode", type=str, default="intervals",
+                   choices=["intervals", "full"],
+                   help="Conflict detection mode: 'intervals' (v2, lighter) "
+                        "or 'full' (v1 legacy, all frames)")
+    p.add_argument("--candidate_percentile", type=float, default=70.0,
+                   help="Score percentile threshold for candidate intervals "
+                        "(v2 intervals mode only)")
     p.add_argument("--seed", type=int, default=1)
     return p.parse_args()
 
@@ -119,6 +126,8 @@ def run(
     normality_percentile: float = 30.0,
     cap_max_flags: int = 20,
     max_captions_per_context: int = 30,
+    detection_mode: str = "intervals",
+    candidate_percentile: float = 70.0,
     default_fps: float = 30.0,
     max_seq_len: int = 4096,
     max_gen_len: int = 2048,
@@ -152,6 +161,7 @@ def run(
     detector = ConflictDetector(
         cap_max_flags=cap_max_flags,
         max_gen_len=max_gen_len,
+        candidate_percentile=candidate_percentile,
     )
 
     with open(annotationfile_path) as _f:
@@ -213,7 +223,9 @@ def run(
             tqdm.write(f"[warn] no contexts generated for {video_name}")
 
         # Phase 3: conflict detection
-        flagged = detector.detect(captions, scores, fps, contexts, generator)
+        flagged = detector.detect(
+            captions, scores, fps, contexts, generator, mode=detection_mode,
+        )
         flag_out_path = os.path.join(
             flagged_output, f"{video_name}.json",
         )
@@ -245,6 +257,8 @@ def main() -> None:
         stride_seconds=args.stride_seconds,
         normality_percentile=args.normality_percentile,
         cap_max_flags=args.cap_max_flags,
+        detection_mode=args.detection_mode,
+        candidate_percentile=args.candidate_percentile,
         default_fps=args.default_fps,
         max_seq_len=args.max_seq_len,
         max_gen_len=args.max_gen_len,

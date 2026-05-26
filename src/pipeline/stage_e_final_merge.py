@@ -50,6 +50,29 @@ CONTEXT_SCORING_SYSTEM = (
     "as a Python list like [0.7]. Begin with '[' and end with ']'. No explanation."
 )
 
+# v2: Bidirectional tag anchoring prompt (used when adversarial Stage D ran)
+BIDIRECTIONAL_TAG_SYSTEM = (
+    "You are a surveillance anomaly scorer. You will receive an OBSERVATION "
+    "and must assess whether it indicates suspicious or criminal activity.\n\n"
+    "CONTEXT: A VLM visually inspected this segment and produced TWO "
+    "competing interpretations. YOU must weigh both and decide.\n\n"
+    "[Potential Anomaly — VLM confidence {positive_confidence:.0%}]:\n"
+    "  {positive_tag}\n\n"
+    "[Plausible Normal Explanation — VLM confidence {negative_confidence:.0%}]:\n"
+    "  {negative_tag}\n\n"
+    "SCENE BACKGROUND: {scene_context}\n\n"
+    "CRITICAL: The VLM confidence scores are self-reported and may be "
+    "inaccurate. Do NOT blindly trust either interpretation. Use them "
+    "only as weak priors. Base your score primarily on the OBSERVATION.\n\n"
+    "SCORING GUIDE:\n"
+    "  [0.0-0.3] Clearly normal — matches the innocent explanation\n"
+    "  [0.3-0.6] Ambiguous — could be either interpretation\n"
+    "  [0.6-0.8] Leaning suspicious — more consistent with the anomaly tag\n"
+    "  [0.8-1.0] Clearly anomalous — strong evidence of suspicious activity\n\n"
+    "Respond with ONLY a number in [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] "
+    "as a Python list like [0.7]. Begin with '[' and end with ']'. No explanation."
+)
+
 
 def _find_context_for_frame(fidx: int, fps: float, windows: list[dict]) -> str:
     """Return the scene context description covering *fidx*, or empty string."""
@@ -257,43 +280,26 @@ def run(
         frames_to_rescore = list(refined_captions.keys()) if refined_captions \
                             else list(flagged_info.keys())
 
-        for fidx in frames_to_rescore:
-            caption = refined_captions.get(fidx)
-            if not caption:
-                continue
+        # Detect if Stage D output is in adversarial format
+        is_adversarial = False
+        if refined_captions:
+            sample_val = next(iter(refined_captions.values()), None)
+            is_adversarial = isinstance(sample_val, dict) and \
+                             "positive_tag" in sample_val
 
-            if use_context:
-                scene_ctx = _find_context_for_frame(fidx, fps, scene_windows)
-                scene_text = scene_ctx[:300] if scene_ctx else (
-                    "A typical surveillance scene. "
-                    "No unusual baseline information available."
-                )
-                finfo = flagged_info.get(fidx, {})
-                conflict_note = _build_conflict_note(finfo)
-                system_prompt = CONTEXT_SCORING_SYSTEM.format(
-                    scene_context=scene_text,
-                    conflict_note=conflict_note,
-                )
-            else:
-                system_prompt = simple_system_prompt
-
-            dialog = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{caption}."},
-            ]
-            try:
-                result = generator.chat_completion(
-                    [dialog],
-                    max_gen_len=max_gen_len,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
-                response = result[0]["generation"]["content"]
-                m = re.search(r"\[(\d+(?:\.\d+)?)\]", response)
-                if m:
-                    refined_scores[fidx] = float(m.group(1))
-            except Exception:
-                pass
+        if is_adversarial:
+            _do_adversarial_scoring(
+                refined_captions, scene_windows, fps, video_folder,
+                video_name, generator, refined_scores,
+                max_gen_len, temperature, top_p,
+            )
+        else:
+            _do_simple_scoring(
+                frames_to_rescore, refined_captions, flagged_info,
+                use_context, scene_windows, fps, simple_system_prompt,
+                generator, refined_scores,
+                max_gen_len, temperature, top_p,
+            )
 
         # ---- Merge scores ----
         num_frames = video.num_frames
@@ -519,6 +525,100 @@ def _save_comparison(
                 f.write(f"  Original refined:   {baseline.get(key, 0):.4f}  "
                         f"(Δ vs P1: {baseline.get(key, 0) - phase1.get(key, 0):+.4f})\n")
             f.write("\n")
+
+
+def _do_adversarial_scoring(
+    refined_captions, scene_windows, fps, video_folder, video_name,
+    generator, refined_scores, max_gen_len, temperature, top_p,
+) -> None:
+    """v2: Score using bidirectional tag anchoring (adversarial format)."""
+    for fidx, adv_data in refined_captions.items():
+        if not isinstance(adv_data, dict):
+            continue
+        caption = adv_data.get("caption_refined", "")
+        if not caption:
+            continue
+
+        scene_ctx = _find_context_for_frame(fidx, fps, scene_windows)
+        scene_text = scene_ctx[:300] if scene_ctx else (
+            "A typical surveillance scene."
+        )
+
+        pos_tag = adv_data.get("positive_tag", "unknown")
+        pos_conf = float(adv_data.get("positive_confidence", 0.5))
+        neg_tag = adv_data.get("negative_tag", "normal interaction")
+        neg_conf = float(adv_data.get("negative_confidence", 0.5))
+
+        system_prompt = BIDIRECTIONAL_TAG_SYSTEM.format(
+            positive_confidence=pos_conf,
+            positive_tag=pos_tag,
+            negative_confidence=neg_conf,
+            negative_tag=neg_tag,
+            scene_context=scene_text,
+        )
+
+        dialog = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"OBSERVATION: {caption}"},
+        ]
+        try:
+            result = generator.chat_completion(
+                [dialog],
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            response = result[0]["generation"]["content"]
+            m = re.search(r"\[(\d+(?:\.\d+)?)\]", response)
+            if m:
+                refined_scores[fidx] = float(m.group(1))
+        except Exception:
+            pass
+
+
+def _do_simple_scoring(
+    frames_to_rescore, refined_captions, flagged_info,
+    use_context, scene_windows, fps, simple_system_prompt,
+    generator, refined_scores, max_gen_len, temperature, top_p,
+) -> None:
+    """v1: Simple or context-aware scoring (non-adversarial format)."""
+    for fidx in frames_to_rescore:
+        caption = refined_captions.get(fidx)
+        if not caption:
+            continue
+
+        if use_context:
+            scene_ctx = _find_context_for_frame(fidx, fps, scene_windows)
+            scene_text = scene_ctx[:300] if scene_ctx else (
+                "A typical surveillance scene. "
+                "No unusual baseline information available."
+            )
+            finfo = flagged_info.get(fidx, {})
+            conflict_note = _build_conflict_note(finfo)
+            system_prompt = CONTEXT_SCORING_SYSTEM.format(
+                scene_context=scene_text,
+                conflict_note=conflict_note,
+            )
+        else:
+            system_prompt = simple_system_prompt
+
+        dialog = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{caption}."},
+        ]
+        try:
+            result = generator.chat_completion(
+                [dialog],
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            response = result[0]["generation"]["content"]
+            m = re.search(r"\[(\d+(?:\.\d+)?)\]", response)
+            if m:
+                refined_scores[fidx] = float(m.group(1))
+        except Exception:
+            pass
 
 
 def _build_conflict_note(finfo: dict) -> str:

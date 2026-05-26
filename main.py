@@ -73,6 +73,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-captions-per-context", type=int, default=30,
                    help="Max normal-frame captions per scene context window "
                         "(default: 30, 0 = no limit)")
+    p.add_argument("--score-gate", action="store_true",
+                   help="v2: Enable dual-threshold Score Gate between Stage B and C. "
+                        "Confident videos skip reflection (C/D/E).")
+    p.add_argument("--adversarial", action="store_true",
+                   help="v2: Enable adversarial dual-perspective VLM verification "
+                        "in Stage D (requires --score-gate implicitly for Stage D)")
+    p.add_argument("--detection-mode", type=str, default="intervals",
+                   choices=["intervals", "full"],
+                   help="Stage C conflict detection mode: 'intervals' (v2, lighter) "
+                        "or 'full' (v1 legacy)")
     return p.parse_args()
 
 
@@ -227,6 +237,69 @@ def main() -> None:
         print_stage_header("B", "SKIPPED (resuming from later stage)")
 
     # =====================================================================
+    # Score Gate (v2, optional) — between Stage B and Stage C
+    # =====================================================================
+    gated_normal: list[str] = []
+    gated_anomalous: list[str] = []
+
+    if args.score_gate and resume <= "C":
+        print_stage_header("GATE", "Dual-Threshold Score Gate")
+        from src.reflection.score_gate import GATE_ANOMALOUS, GATE_NORMAL, ScoreGate
+
+        gate = ScoreGate()
+        gated_normal, gated_anomalous = [], []
+
+        # Load all scores
+        scores_dir = scores_for_c
+        import glob as _glob
+        for score_path in sorted(_glob.glob(f"{scores_dir}/*.json")):
+            vname = Path(score_path).stem
+            if video_filter and vname not in video_filter:
+                continue
+            with open(score_path) as f:
+                scores = json.load(f)
+            decision, reason = gate.decide(scores)
+
+            if decision == GATE_NORMAL:
+                gated_normal.append(vname)
+                print(f"  [GATE:NORMAL]    {vname}: {reason}")
+            elif decision == GATE_ANOMALOUS:
+                gated_anomalous.append(vname)
+                print(f"  [GATE:ANOMALOUS] {vname}: {reason}")
+            else:
+                pass  # will go through Stage C
+
+        if gated_normal:
+            # Write all-normal scores for gated videos
+            out_dir = paths["stage_e_out"]
+            os.makedirs(out_dir, exist_ok=True)
+            for vname in gated_normal:
+                gate_out = os.path.join(out_dir, f"{vname}.json")
+                phase1_path = os.path.join(scores_dir, f"{vname}.json")
+                if os.path.exists(phase1_path):
+                    # Keep Phase 1 but set all to low scores
+                    with open(phase1_path) as f:
+                        p1 = json.load(f)
+                    all_low = {k: min(float(v), 0.15) for k, v in p1.items()}
+                    with open(gate_out, "w") as f:
+                        json.dump(all_low, f, indent=2)
+
+        if gated_anomalous:
+            # Copy Phase 1 scores directly for gated anomalous videos
+            out_dir = paths["stage_e_out"]
+            os.makedirs(out_dir, exist_ok=True)
+            from shutil import copy2
+            for vname in gated_anomalous:
+                src = os.path.join(scores_dir, f"{vname}.json")
+                dst = os.path.join(out_dir, f"{vname}.json")
+                if os.path.exists(src):
+                    copy2(src, dst)
+
+        print(f"  Gate result: {len(gated_normal)} normal, "
+              f"{len(gated_anomalous)} anomalous "
+              f"(skip C/D/E), remaining → Stage C")
+
+    # =====================================================================
     # Stage C: LLM — Context memory + Conflict detection
     # =====================================================================
     if resume <= "C":
@@ -234,19 +307,27 @@ def main() -> None:
         t0 = time.time()
 
         from src.pipeline.stage_c_context_reflect import run as run_c
-        run_c(
-            root_path=paths["root_path"],
-            annotationfile_path=paths["anno_index"],
-            captions_dir=captions_for_c,
-            scores_dir=scores_for_c,
-            video_folder=paths["video_folder"],
-            context_output=paths["stage_c_context"],
-            flagged_output=paths["stage_c_flagged"],
-            ckpt_dir=paths["ckpt_dir"],
-            tokenizer_path=paths["tokenizer_path"],
-            max_captions_per_context=args.max_captions_per_context,
-            video_filter=video_filter,
-        )
+
+        # Exclude gated videos from Stage C
+        skip_videos = set(gated_normal + gated_anomalous)
+        c_video_filter = [v for v in video_filter if v not in skip_videos] \
+                         if video_filter else None
+
+        if c_video_filter or video_filter is None:
+            run_c(
+                root_path=paths["root_path"],
+                annotationfile_path=paths["anno_index"],
+                captions_dir=captions_for_c,
+                scores_dir=scores_for_c,
+                video_folder=paths["video_folder"],
+                context_output=paths["stage_c_context"],
+                flagged_output=paths["stage_c_flagged"],
+                ckpt_dir=paths["ckpt_dir"],
+                tokenizer_path=paths["tokenizer_path"],
+                max_captions_per_context=args.max_captions_per_context,
+                detection_mode=args.detection_mode,
+                video_filter=c_video_filter,
+            )
         print(f"  Stage C elapsed: {time.time() - t0:.0f}s")
     else:
         print_stage_header("C", "SKIPPED (resuming from later stage)")
@@ -265,7 +346,13 @@ def main() -> None:
 
     if run_d:
         print_stage_header("D", "Targeted Visual Verification [VLM, ~15 GB]")
+        if args.adversarial:
+            print("  v2 ADVERSARIAL mode: dual-perspective VLM verification")
         t0 = time.time()
+
+        skip_videos_d = set(gated_normal + gated_anomalous)
+        d_video_filter = [v for v in video_filter if v not in skip_videos_d] \
+                         if video_filter else None
 
         from src.pipeline.stage_d_targeted_verify import run as run_d_fn
         run_d_fn(
@@ -276,7 +363,8 @@ def main() -> None:
             output_dir=paths["stage_d_out"],
             root_path=paths["root_path"],
             mode="fine",
-            video_filter=video_filter,
+            adversarial=args.adversarial,
+            video_filter=d_video_filter,
         )
         print(f"  Stage D elapsed: {time.time() - t0:.0f}s")
     elif not run_d and resume <= "D":
@@ -294,6 +382,11 @@ def main() -> None:
     # Stage E reads original scores from wherever Stage C got them
     refined_dir = paths["stage_d_out"] if run_d else None
 
+    # Exclude gated videos (already written by Score Gate)
+    skip_videos_e = set(gated_normal + gated_anomalous)
+    e_video_filter = [v for v in video_filter if v not in skip_videos_e] \
+                     if video_filter else None
+
     run_e(
         root_path=paths["root_path"],
         annotationfile_path=paths["anno_index"],
@@ -308,7 +401,7 @@ def main() -> None:
         run_eval=not args.no_eval,
         temporal_annotation_file=paths["anno_temporal"],
         refined_baseline_dir=paths["refined_baseline"],
-        video_filter=video_filter,
+        video_filter=e_video_filter,
     )
     print(f"  Stage E elapsed: {time.time() - t0:.0f}s")
 
