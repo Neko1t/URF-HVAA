@@ -293,6 +293,22 @@ def run(
                 video_name, generator, refined_scores,
                 max_gen_len, temperature, top_p,
             )
+            # Fallback: score frames that adversarial verify failed on
+            # using simple context-aware prompt (from flagged_info)
+            missing = [f for f in frames_to_rescore
+                       if f not in refined_scores]
+            if missing and flagged_info:
+                missing_captions = {
+                    f: flagged_info[f].get("caption_summary", "")
+                    for f in missing if f in flagged_info
+                }
+                _do_simple_scoring(
+                    missing, missing_captions, flagged_info,
+                    use_context=True, scene_windows=scene_windows, fps=fps,
+                    simple_system_prompt=simple_system_prompt,
+                    generator=generator, refined_scores=refined_scores,
+                    max_gen_len=max_gen_len, temperature=temperature, top_p=top_p,
+                )
         else:
             _do_simple_scoring(
                 frames_to_rescore, refined_captions, flagged_info,
@@ -584,6 +600,10 @@ def _do_simple_scoring(
     """v1: Simple or context-aware scoring (non-adversarial format)."""
     for fidx in frames_to_rescore:
         caption = refined_captions.get(fidx)
+        if not caption:
+            # Fallback: use original Phase 1 caption from flagged_info
+            # (needed when Stage D failed to produce refined captions)
+            caption = flagged_info.get(fidx, {}).get("caption_summary", "")
         if not caption:
             continue
 

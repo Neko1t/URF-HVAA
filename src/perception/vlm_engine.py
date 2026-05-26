@@ -172,7 +172,7 @@ class VLMEngine:
             trust_remote_code=True,
             device_map=self._device,
             torch_dtype=self._float_dtype,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         self.processor = AutoProcessor.from_pretrained(
             self.model_path, trust_remote_code=True
@@ -228,7 +228,7 @@ class VLMEngine:
         # Resolve sampling parameters
         if interval is None:
             interval = 5 if mode == "coarse" else 2.5
-        max_frames = 8 if mode == "coarse" else 16
+        max_frames = 8 if mode == "coarse" else 10
 
         # Clamp segment window to valid range
         center_sec = frame_idx / fps
@@ -283,7 +283,7 @@ class VLMEngine:
         # Resolve sampling parameters — Phase 4 uses fine-grained by default
         if interval is None:
             interval = 2.5 if mode == "fine" else 5
-        max_frames = 16 if mode == "fine" else 8
+        max_frames = 10 if mode == "fine" else 8
 
         center_sec = frame_idx / fps
         start_sec = max(0.0, center_sec - interval)
@@ -341,7 +341,7 @@ class VLMEngine:
         # Resolve sampling parameters
         if interval is None:
             interval = 2.5 if mode == "fine" else 5
-        max_frames = 16 if mode == "fine" else 8
+        max_frames = 10 if mode == "fine" else 8
 
         center_sec = frame_idx / fps
         start_sec = max(0.0, center_sec - interval)
@@ -484,6 +484,69 @@ class VLMEngine:
 
     @torch.inference_mode()
     def _infer(self, conversation: list[dict], temperature: float = 0.1) -> str:
+        """Run a VLM inference pass with deterministic frame count.
+
+        Setting processor.fps=None skips the ffmpeg fps filter so load_video
+        extracts all frames, then uniformly downsamples to exactly max_frames.
+        This eliminates +-1 frame jitter that causes tensor shape mismatches
+        in VideoLLaMA3's visual-token pipeline.
+        """
+        if not conversation:
+            return ""
+
+        _orig_fps = getattr(self.processor, 'fps', None)
+        self.processor.fps = None
+        try:
+            inputs = self.processor(
+                conversation=conversation,
+                add_system_prompt=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+        finally:
+            if _orig_fps is not None:
+                self.processor.fps = _orig_fps
+
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                if k == "pixel_values":
+                    inputs[k] = v.to(self._device, dtype=self._float_dtype)
+                else:
+                    inputs[k] = v.to(self._device)
+
+        seq_key = 'inputs_embeds' if 'inputs_embeds' in inputs else 'input_ids'
+        if seq_key in inputs and 'attention_mask' in inputs:
+            tl = inputs[seq_key].shape[1]
+            ml = inputs['attention_mask'].shape[1]
+            if ml != tl:
+                if ml > tl:
+                    inputs['attention_mask'] = inputs['attention_mask'][:, :tl]
+                else:
+                    pad = inputs['attention_mask'].new_ones(
+                        inputs['attention_mask'].shape[0], tl - ml)
+                    inputs['attention_mask'] = torch.cat(
+                        [inputs['attention_mask'], pad], dim=1)
+
+        try:
+            output_ids = self.model.generate(
+                **inputs, max_new_tokens=128, temperature=temperature
+            )
+        except RuntimeError as exc:
+            err = str(exc)
+            print(f"
+{'='*60}", flush=True)
+            print(f"[VLM CRASH] {err[:120]}", flush=True)
+            print(f"{'='*60}", flush=True)
+            for k, v in inputs.items():
+                if hasattr(v, 'shape'):
+                    print(f"  inputs['{k}'].shape = {tuple(v.shape)}", flush=True)
+            print(f"{'='*60}
+", flush=True)
+            raise
+
+        return self.processor.batch_decode(
+            output_ids, skip_special_tokens=True
+        )[0]fer(self, conversation: list[dict], temperature: float = 0.1) -> str:
         """Run a single inference pass."""
         if not conversation:
             return ""
@@ -503,7 +566,7 @@ class VLMEngine:
                     inputs[k] = v.to(self._device)
 
         output_ids = self.model.generate(
-            **inputs, max_new_tokens=256, temperature=temperature
+            **inputs, max_new_tokens=128, temperature=temperature
         )
         return self.processor.batch_decode(
             output_ids, skip_special_tokens=True

@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
                    help="VLM sampling mode (default: fine)")
     p.add_argument("--adversarial", action="store_true",
                    help="v2: Use dual-perspective adversarial VLM verification")
+    p.add_argument("--video_name", type=str, default=None,
+                   help="Process only this single video (by name, without .mp4)")
     return p.parse_args()
 
 
@@ -235,6 +237,7 @@ def main() -> None:
         root_path=args.root_path,
         mode=args.mode,
         adversarial=args.adversarial,
+        video_filter=[args.video_name] if args.video_name else None,
     )
 
 
