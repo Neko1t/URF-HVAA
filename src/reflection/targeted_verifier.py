@@ -17,10 +17,12 @@ full fine-grained scan (interval=4).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
+from tqdm import tqdm
 
 from src.perception.vlm_engine import FlaggedFrame, SceneContext, VLMEngine
 
@@ -133,6 +135,7 @@ class TargetedVerifier:
         contexts: List[SceneContext],
         fps: float,
         mode: str = "fine",
+        progress: bool = False,
     ) -> Dict[int, str]:
         """Run targeted VLM verification on each flagged frame.
 
@@ -143,17 +146,26 @@ class TargetedVerifier:
             contexts: SceneContext list from Phase 2.
             fps: Video frames per second.
             mode: Sampling mode ('fine' = dense, high-quality).
+            progress: If True, show per-frame tqdm progress bar.
 
         Returns:
             {frame_idx: refined_caption_text}
         """
         refined: Dict[int, str] = {}
+        video_name = os.path.basename(video_path).replace(".mp4", "")
 
-        for ff in flagged_frames:
+        ff_iter = tqdm(flagged_frames, desc=f"  VLM verify {video_name}",
+                       unit="frame", leave=False, ncols=100) if progress \
+                  else flagged_frames
+
+        for ff in ff_iter:
             ctx = self._find_context(ff.frame, fps, contexts)
             if ctx is None:
                 logger.debug("Frame %d: no SceneContext covers it, skipping.", ff.frame)
                 continue
+
+            if progress:
+                ff_iter.set_postfix_str(f"f{ff.frame}")
 
             try:
                 caption = vlm_engine.guided_caption(
@@ -166,7 +178,9 @@ class TargetedVerifier:
                 refined[ff.frame] = caption
                 self.tracker.phase4_vlm_calls += 1
             except Exception:
-                logger.exception("VLM guided_caption failed for frame %d", ff.frame)
+                logger.warning(
+                    "VLM verify skipped frame %d (model internal error, frame OK)", ff.frame,
+                )
 
         self.tracker.flagged_count = len(flagged_frames)
         return refined

@@ -150,6 +150,7 @@ class ConflictDetector:
         cap_max_flags: int = 20,
         batch_size: int = 15,
         min_score_percentile: float = 50.0,
+        max_gen_len: int = 2048,
     ):
         """
         Args:
@@ -159,10 +160,13 @@ class ConflictDetector:
             min_score_percentile: Only keep flagged frames whose anomaly
                 score exceeds this percentile of **all** scores in the video
                 (0–100).  Default 50 = median.  Set to 0 to disable.
+            max_gen_len: Max output tokens for conflict detection LLM calls.
+                Needs to be generous for multi-flag JSON output.
         """
         self.cap_max_flags = cap_max_flags
         self.batch_size = batch_size
         self.min_score_percentile = min_score_percentile
+        self.max_gen_len = max_gen_len
 
     # -- public API ---------------------------------------------------------
 
@@ -328,7 +332,7 @@ class ConflictDetector:
         try:
             results = llm_generator.chat_completion(
                 dialogs,
-                max_gen_len=1024,
+                max_gen_len=self.max_gen_len,
                 temperature=0.1,
                 top_p=0.9,
             )

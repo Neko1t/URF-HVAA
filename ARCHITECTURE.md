@@ -6,12 +6,15 @@ This document describes the refactored architecture for the paper *"A Unified Re
 
 The core innovation is an **Asymmetric Dual-Pass Reflection Loop** — replacing the offline VLM pre-captioning pipeline with a closed-loop perception-reasoning system inspired by human cognitive patterns ("top-down perception guidance").
 
+**Unified entry point**: `python main.py` (full experiment) / `python main.py --quick-test` (5-video pre-experiment). Both share identical pipeline code under `src/pipeline/`.
+
 ## Design Principles
 
-1. **Serial model loading with file-based handoff** — GPU only hosts one model at a time (VLM ~15GB or LLM ~16GB, never both). Avoids OOM on single RTX 3090/4090.
+1. **Serial model loading with file-based handoff** — GPU only hosts one model at a time (VLM ~15GB or LLM ~16GB, never both). Each stage explicitly cleans up (`del` + `torch.cuda.empty_cache()`) before returning, guaranteeing no OOM on single RTX 3090/4090.
 2. **Asymmetric compute allocation** — LLM (cheap) does full-traversal reasoning; VLM (expensive) is invoked only on-demand for targeted re-examination.
 3. **Anti-hallucination by design** — Phase 4 VLM prompts are neutral verification queries, never leading suggestions.
 4. **Coarse-to-fine sampling** — Phase 1 uses interval=16 (patrol mode); Phase 4 uses interval=4 (focus mode).
+5. **Context-aware final scoring** — Stage E injects Phase 2 scene baseline + Phase 3 conflict notes into LLM scoring prompts, ensuring re-evaluation uses full context (not just better captions).
 
 ---
 
@@ -22,11 +25,12 @@ The core innovation is an **Asymmetric Dual-Pass Reflection Loop** — replacing
 | Stage A - Coarse Blind Captioning [VLM only, ~15GB]               |
 |   video -> blind_caption(interval=16, max_frames=8)               |
 |        -> captions/phase1_coarse/{video}.json                     |
-|   Unload VLM                                                      |
+|   engine.unload() → torch.cuda.empty_cache()                      |
 +------------------------------------------------------------------+
 | Stage B - Initial Scoring [LLM only, ~16GB]                       |
 |   captions -> llm_anomaly_scorer (generic scoring)                |
 |           -> scores/phase1_initial/{video}.json                   |
+|   scorer.cleanup() → del generator + torch.cuda.empty_cache()     |
 +------------------------------------------------------------------+
 | Stage C - Context Memory + Conflict Detection [LLM only, ~16GB]   |
 |   captions + scores                                               |
@@ -35,20 +39,22 @@ The core innovation is an **Asymmetric Dual-Pass Reflection Loop** — replacing
 |        -> context/phase2/{video}_windows.json                     |
 |     -> Phase 3: ConflictDetector (full traversal + reason output) |
 |        -> reflection/phase3_flagged/{video}.json                  |
-|   Unload LLM                                                      |
+|   del generator → torch.cuda.empty_cache()                        |
 +------------------------------------------------------------------+
 | Stage D - Fine-Grained Targeted Verification [VLM only, ~15GB]    |
 |   flagged_list + scene_context                                    |
 |     -> guided_caption(interval=4, max_frames=16,                 |
 |                       anti-hallucination prompt)                  |
 |        -> captions/phase4_fine/{video}.json (flagged frames only) |
-|   Unload VLM                                                      |
+|   engine.unload() → torch.cuda.empty_cache()                      |
 +------------------------------------------------------------------+
 | Stage E - Final Scoring + Merge [LLM only, ~16GB]                 |
-|   refined captions -> LLM rescore                                 |
-|   Score merge (replace flagged) + global Gaussian smooth          |
+|   refined captions + context + flagged info                       |
+|     -> LLM rescore WITH scene baseline + conflict notes           |
+|   Score merge (replace flagged) + global Gaussian smooth (σ=2)    |
 |     -> scores/final/{video}.json                                  |
-|   -> eval.py (unchanged)                                          |
+|   Optional: AUC evaluation (ROC-AUC + PR-AUC)                     |
+|   del generator → torch.cuda.empty_cache()                        |
 +------------------------------------------------------------------+
 ```
 
@@ -206,25 +212,52 @@ class ConflictDetector:
 
 ```python
 class TargetedVerifier:
-    def verify_frame(self, vlm, video_path, flagged_frame, scene_context):
+    def verify_frames(self, vlm, video_path, flagged_frames, contexts, fps,
+                      mode="fine", progress=False):
         """
-        Single-frame targeted re-examination:
+        Per-frame targeted re-examination with tqdm support:
         - interval=4 (4x denser than Phase 1)
         - max_frames=16 (2x more frames than Phase 1)
+        - Matches each flagged frame to its covering SceneContext by timestamp
         - Prompt includes conflict_reason + alternative_explanation
         """
 
     def rescore(self, llm_scorer, refined_captions):
-        """Reuse llm_anomaly_scorer logic on refined captions."""
+        """Simple rescore (no context). Kept for backward compatibility."""
 
-    def merge_scores(self, original_scores, flagged_scores):
+    def merge_scores(self, original_scores, refined_scores, num_frames, sigma=2.0):
         """
-        1. Replace flagged frame scores with refined scores
-        2. Apply global 1D Gaussian filter (sigma=2) to ENTIRE score array
+        1. Build dense array from original scores (linear interp for gaps)
+        2. Replace flagged frame scores with refined scores
+        3. Apply global 1D Gaussian filter (sigma=2) to ENTIRE score array
            - Smooths replacement boundaries
            - Removes LLM scoring jitter (usually improves AUC)
         """
 ```
+
+**Stage E context-aware scoring** (implemented in `stage_e_final_merge.py`):
+
+When `context_dir` and `flagged_dir` are provided, Stage E uses an enriched prompt:
+
+```
+SYSTEM: You are a surveillance anomaly scorer. Compare the OBSERVATION
+against the SCENE BASELINE and output a score.
+
+SCENE BASELINE (normal, expected activity in this area):
+{scene_context}
+
+SCORING GUIDE:
+  [0.0-0.3] Matches baseline — normal, routine, expected behavior
+  [0.3-0.6] Minor deviation — unusual but plausibly benign
+  [0.6-0.8] Concerning — clear deviation from expected activity
+  [0.8-1.0] Highly anomalous — strong indicators of suspicious behavior
+
+PRIOR NOTE: a previous scan flagged potential "{suspicious_element}",
+but this could simply be "{alternative_explanation}".
+Weigh this information but base your score on the actual observation.
+```
+
+This closes the loop: Phase 2 (scene baseline) + Phase 3 (conflict notes) → Stage E scoring.
 
 **Why global Gaussian instead of local?**
 - Local smoothing around flagged frames creates artifacts when multiple flags cluster
@@ -298,45 +331,91 @@ Expected savings: 60-80%+ VLM compute vs. naive full fine-grained scan.
 
 ---
 
+## Unified Entry Point
+
+```bash
+# Pre-experiment (5 representative videos, ~25-40 min)
+python main.py --quick-test
+
+# Full experiment (all videos in dataset)
+python main.py
+
+# Full experiment, text-only (skip VLM Stage D)
+python main.py --skip-stage-d
+
+# Switch dataset
+python main.py --dataset xd_violence
+```
+
+`main.py` orchestrates all 5 stages in-process, each stage managing its own model load/unload. Same code runs for both pre-experiment and full experiment — only the video list differs.
+
+## GPU Lifecycle Guarantee
+
+Each stage's `run()` function explicitly cleans up before returning:
+
+```
+[VLM load] → Stage A → engine.unload() → empty_cache()
+[LLM load] → Stage B → scorer.cleanup() → del + empty_cache()
+[LLM load] → Stage C → del generator → empty_cache()
+[VLM load] → Stage D → engine.unload() → empty_cache()
+[LLM load] → Stage E → del generator → empty_cache()
+```
+
+No two models are ever co-resident on GPU. Peak VRAM usage: ~16GB (LLM) or ~15GB (VLM). Single RTX 3090 (24GB) is sufficient.
+
 ## Pipeline Shell Invocations
 
-Each stage runs independently. GPU hosts only ONE model at a time.
+Each stage can also run independently as a CLI:
 
 ```bash
 # Stage A - Coarse blind captioning [VLM]
-python -m src.pipeline.stage_a_coarse_caption \
+python src/pipeline/stage_a_coarse_caption.py \
     --video_folder ./data/{dataset}/videos/ \
     --index_file ./data/{dataset}/annotations/test.txt \
     --output_dir ./data/{dataset}/captions/phase1_coarse/
 
 # Stage B - Initial LLM scoring [LLM]
-python -m src.pipeline.stage_b_initial_scoring \
+python src/pipeline/stage_b_initial_scoring.py \
+    --root_path ./data/{dataset} \
+    --annotationfile_path ./data/{dataset}/annotations/test.txt \
     --captions_dir ./data/{dataset}/captions/phase1_coarse/ \
     --output_dir ./data/{dataset}/scores/phase1_initial/ \
     --ckpt_dir ./libs/llama/llama3.1-8b/ \
     --tokenizer_path ./libs/llama/llama3.1-8b/tokenizer.model
 
 # Stage C - Context memory + conflict detection [LLM]
-python -m src.pipeline.stage_c_context_reflect \
+python src/pipeline/stage_c_context_reflect.py \
+    --root_path ./data/{dataset} \
+    --annotationfile_path ./data/{dataset}/annotations/test.txt \
     --captions_dir ./data/{dataset}/captions/phase1_coarse/ \
     --scores_dir ./data/{dataset}/scores/phase1_initial/ \
+    --video_folder ./data/{dataset}/videos/ \
     --context_output ./data/{dataset}/context/phase2/ \
     --flagged_output ./data/{dataset}/reflection/phase3_flagged/ \
     --ckpt_dir ./libs/llama/llama3.1-8b/ \
     --tokenizer_path ./libs/llama/llama3.1-8b/tokenizer.model
 
 # Stage D - Targeted VLM verification [VLM]
-python -m src.pipeline.stage_d_targeted_verify \
-    --flagged_list ./data/{dataset}/reflection/phase3_flagged/ \
-    --scene_context ./data/{dataset}/context/phase2/ \
+python src/pipeline/stage_d_targeted_verify.py \
+    --flagged_dir ./data/{dataset}/reflection/phase3_flagged/ \
+    --context_dir ./data/{dataset}/context/phase2/ \
     --video_folder ./data/{dataset}/videos/ \
-    --output_dir ./data/{dataset}/captions/phase4_fine/
+    --annotationfile_path ./data/{dataset}/annotations/test.txt \
+    --output_dir ./data/{dataset}/captions/phase4_fine/ \
+    --root_path ./data/{dataset}
 
 # Stage E - Final scoring + merge + eval [LLM]
-python -m src.pipeline.stage_e_final_merge \
-    --original_scores ./data/{dataset}/scores/phase1_initial/ \
-    --refined_captions ./data/{dataset}/captions/phase4_fine/ \
+# With context-aware scoring (recommended):
+python src/pipeline/stage_e_final_merge.py \
+    --root_path ./data/{dataset} \
+    --annotationfile_path ./data/{dataset}/annotations/test.txt \
+    --original_scores_dir ./data/{dataset}/scores/phase1_initial/ \
+    --refined_captions_dir ./data/{dataset}/captions/phase4_fine/ \
     --output_dir ./data/{dataset}/scores/final/ \
     --ckpt_dir ./libs/llama/llama3.1-8b/ \
-    --tokenizer_path ./libs/llama/llama3.1-8b/tokenizer.model
+    --tokenizer_path ./libs/llama/llama3.1-8b/tokenizer.model \
+    --context_dir ./data/{dataset}/context/phase2/ \
+    --flagged_dir ./data/{dataset}/reflection/phase3_flagged/ \
+    --run_eval \
+    --temporal_annotation_file ./data/{dataset}/annotations/Temporal_Anomaly_Annotation_for_Testing_Videos.txt
 ```

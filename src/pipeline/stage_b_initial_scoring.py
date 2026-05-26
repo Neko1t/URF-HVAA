@@ -13,9 +13,12 @@ import argparse
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from libs.llama.llama import Dialog, Llama
@@ -65,20 +68,49 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 class StageBScorer:
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
+    def __init__(
+        self,
+        ckpt_dir: str,
+        tokenizer_path: str,
+        captions_dir: str,
+        context_prompt: str,
+        format_prompt: str,
+        batch_size: int = 32,
+        frame_interval: int = 16,
+        max_seq_len: int = 512,
+        max_gen_len: int = 64,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        seed: int = 1,
+    ):
+        self.captions_dir = captions_dir
+        self.context_prompt = context_prompt
+        self.format_prompt = format_prompt
+        self.batch_size = batch_size
+        self.frame_interval = frame_interval
+        self.max_gen_len = max_gen_len
+        self.temperature = temperature
+        self.top_p = top_p
+
         ensure_single_gpu_distributed()
         self.generator = Llama.build(
-            ckpt_dir=args.ckpt_dir,
-            tokenizer_path=args.tokenizer_path,
-            max_seq_len=args.max_seq_len,
-            max_batch_size=args.batch_size,
-            seed=args.seed,
+            ckpt_dir=ckpt_dir,
+            tokenizer_path=tokenizer_path,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            model_parallel_size=1,
+            seed=seed,
         )
+
+    def cleanup(self) -> None:
+        if self.generator is not None:
+            del self.generator
+            self.generator = None
+        torch.cuda.empty_cache()
 
     def score_video(self, video: VideoRecord) -> dict[str, float]:
         video_name = Path(video.path).name.replace(".mp4", "")
-        caption_path = os.path.join(self.args.captions_dir, f"{video_name}.json")
+        caption_path = os.path.join(self.captions_dir, f"{video_name}.json")
 
         if not os.path.exists(caption_path):
             tqdm.write(f"[skip] no captions: {caption_path}")
@@ -87,9 +119,9 @@ class StageBScorer:
         with open(caption_path, "r") as f:
             captions = json.load(f)
 
-        system_prompt = self.args.context_prompt + " " + self.args.format_prompt
-        frame_step = self.args.frame_interval
-        batch_size = self.args.batch_size
+        system_prompt = self.context_prompt + " " + self.format_prompt
+        frame_step = self.frame_interval
+        batch_size = self.batch_size
 
         video_scores: dict[str, float] = {}
 
@@ -113,9 +145,9 @@ class StageBScorer:
 
             results = self.generator.chat_completion(
                 dialogs,
-                max_gen_len=self.args.max_gen_len,
-                temperature=self.args.temperature,
-                top_p=self.args.top_p,
+                max_gen_len=self.max_gen_len,
+                temperature=self.temperature,
+                top_p=self.top_p,
             )
 
             for result, fidx in zip(results, batch_frames):
@@ -123,7 +155,6 @@ class StageBScorer:
                 score = self._parse_score(response)
                 video_scores[str(fidx)] = score
 
-        # Interpolate missing scores
         return self._interpolate(video_scores)
 
     @staticmethod
@@ -146,26 +177,81 @@ class StageBScorer:
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+def run(
+    root_path: str,
+    annotationfile_path: str,
+    captions_dir: str,
+    output_dir: str,
+    ckpt_dir: str,
+    tokenizer_path: str,
+    context_prompt: str = (
+        "How would you rate the scene described on a scale from 0 to 1, "
+        "with 0 representing a standard scene and 1 denoting a scene "
+        "with suspicious or potentially criminal activities?"
+    ),
+    format_prompt: str = (
+        "Respond with exactly one number in a Python list "
+        "[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, "
+        "1.0]. Start with '[' and end with ']'. No extra text."
+    ),
+    batch_size: int = 32,
+    frame_interval: int = 16,
+    max_seq_len: int = 512,
+    max_gen_len: int = 64,
+    temperature: float = 0.6,
+    top_p: float = 0.9,
+    seed: int = 1,
+    video_filter: Optional[list[str]] = None,
+) -> None:
+    """Stage B: initial LLM scoring (programmatic entry point).
+
+    Args:
+        video_filter: If given, only process videos whose names are in this list.
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
     # Save prompts for reproducibility
-    with open(os.path.join(args.output_dir, "context_prompt.txt"), "w") as f:
-        f.write(args.context_prompt)
-    with open(os.path.join(args.output_dir, "format_prompt.txt"), "w") as f:
-        f.write(args.format_prompt)
+    with open(os.path.join(output_dir, "context_prompt.txt"), "w") as f:
+        f.write(context_prompt)
+    with open(os.path.join(output_dir, "format_prompt.txt"), "w") as f:
+        f.write(format_prompt)
 
-    scorer = StageBScorer(args)
+    scorer = StageBScorer(
+        ckpt_dir=ckpt_dir,
+        tokenizer_path=tokenizer_path,
+        captions_dir=captions_dir,
+        context_prompt=context_prompt,
+        format_prompt=format_prompt,
+        batch_size=batch_size,
+        frame_interval=frame_interval,
+        max_seq_len=max_seq_len,
+        max_gen_len=max_gen_len,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+    )
 
-    video_list = [
-        VideoRecord(x.strip().split(), args.root_path)
-        for x in open(args.annotationfile_path)
-    ]
+    with open(annotationfile_path) as _f:
+        video_list = [
+            VideoRecord(x.strip().split(), root_path)
+            for x in _f
+        ]
+
+    if video_filter is not None:
+        filter_set = set(video_filter)
+        video_list = [
+            v for v in video_list
+            if Path(v.path).name.replace(".mp4", "") in filter_set
+        ]
+
+    if not video_list:
+        print("Stage B: no videos to process.")
+        scorer.cleanup()
+        return
 
     for video in tqdm(video_list, desc="Stage B: initial scoring"):
         video_name = Path(video.path).name.replace(".mp4", "")
-        output_path = os.path.join(args.output_dir, f"{video_name}.json")
+        output_path = os.path.join(output_dir, f"{video_name}.json")
 
         if os.path.isfile(output_path):
             continue
@@ -177,7 +263,29 @@ def main() -> None:
         with open(output_path, "w") as f:
             json.dump(scores, f, indent=2)
 
-    print(f"Stage B done. Scores saved to {args.output_dir}")
+    scorer.cleanup()
+    print(f"Stage B done. Scores saved to {output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    run(
+        root_path=args.root_path,
+        annotationfile_path=args.annotationfile_path,
+        captions_dir=args.captions_dir,
+        output_dir=args.output_dir,
+        ckpt_dir=args.ckpt_dir,
+        tokenizer_path=args.tokenizer_path,
+        context_prompt=args.context_prompt,
+        format_prompt=args.format_prompt,
+        batch_size=args.batch_size,
+        frame_interval=args.frame_interval,
+        max_seq_len=args.max_seq_len,
+        max_gen_len=args.max_gen_len,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":

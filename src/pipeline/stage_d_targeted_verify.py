@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
 import cv2
 from tqdm import tqdm
@@ -78,30 +79,56 @@ def _load_contexts(path: str) -> list[SceneContext]:
     ]
 
 
-def _get_fps(video_path: str) -> float:
+def _get_video_meta(video_path: str) -> tuple[float, int]:
+    """Return (fps, frame_count) from a single VideoCapture open."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return 0.0
+        return 0.0, 0
     fps = cap.get(cv2.CAP_PROP_FPS)
+    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-    return float(fps) if fps > 0 else 0.0
+    return (float(fps) if fps > 0 else 0.0), nframes
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+def run(
+    flagged_dir: str,
+    context_dir: str,
+    video_folder: str,
+    annotationfile_path: str,
+    output_dir: str,
+    root_path: str,
+    mode: str = "fine",
+    video_filter: Optional[list[str]] = None,
+) -> None:
+    """Stage D: targeted VLM verification (programmatic entry point).
 
-    # Read video list
+    Args:
+        video_filter: If given, only process videos whose names are in this list.
+    """
     from src.data.video_record import VideoRecord
 
-    video_list = [
-        VideoRecord(x.strip().split(), args.root_path)
-        for x in open(args.annotationfile_path)
-    ]
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(annotationfile_path) as _f:
+        video_list = [
+            VideoRecord(x.strip().split(), root_path)
+            for x in _f
+        ]
+
+    if video_filter is not None:
+        filter_set = set(video_filter)
+        video_list = [
+            v for v in video_list
+            if Path(v.path).name.replace(".mp4", "") in filter_set
+        ]
+
+    if not video_list:
+        print("Stage D: no videos to process.")
+        return
 
     engine = VLMEngine()
     engine.load()
@@ -111,18 +138,16 @@ def main() -> None:
 
     for video in tqdm(video_list, desc="Stage D: targeted verify"):
         video_name = Path(video.path).name.replace(".mp4", "")
-        video_path = os.path.join(args.video_folder, f"{video_name}.mp4")
+        video_path = os.path.join(video_folder, f"{video_name}.mp4")
 
-        # Load flagged frames
-        flagged_path = os.path.join(args.flagged_dir, f"{video_name}.json")
+        flagged_path = os.path.join(flagged_dir, f"{video_name}.json")
         if not os.path.exists(flagged_path):
             continue
         flagged_frames = _load_flagged(flagged_path)
         if not flagged_frames:
             continue
 
-        # Load scene contexts
-        context_path = os.path.join(args.context_dir, f"{video_name}_windows.json")
+        context_path = os.path.join(context_dir, f"{video_name}_windows.json")
         if not os.path.exists(context_path):
             tqdm.write(f"[skip] no contexts: {context_path}")
             continue
@@ -130,29 +155,24 @@ def main() -> None:
         if not contexts:
             continue
 
-        # Get FPS + frame count
-        fps = _get_fps(video_path)
-        total_frames = video.num_frames if video.num_frames > 0 else (
-            int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT))
-        )
-
+        fps, total_frames_from_video = _get_video_meta(video_path)
         if fps <= 0:
             tqdm.write(f"[skip] cannot read FPS for: {video_path}")
             continue
 
-        # Phase 4a: VLM verification (only flagged frames)
+        total_frames = video.num_frames if video.num_frames > 0 else total_frames_from_video
+
         refined = verifier.verify_frames(
-            engine, video_path, flagged_frames, contexts, fps, mode=args.mode,
+            engine, video_path, flagged_frames, contexts, fps,
+            mode=mode, progress=True,
         )
 
-        # Track compute for this video
         global_tracker.total_frames += total_frames
         global_tracker.phase1_vlm_calls += total_frames // 16
         global_tracker.phase4_vlm_calls += verifier.tracker.phase4_vlm_calls
         global_tracker.flagged_count += len(flagged_frames)
 
-        # Save refined captions
-        output_path = os.path.join(args.output_dir, f"{video_name}.json")
+        output_path = os.path.join(output_dir, f"{video_name}.json")
         with open(output_path, "w") as f:
             json.dump(refined, f, indent=2)
 
@@ -162,12 +182,24 @@ def main() -> None:
 
     engine.unload()
 
-    # Print compute savings
     global_tracker.print_report()
-    tracker_path = os.path.join(args.output_dir, "_compute_tracker.json")
+    tracker_path = os.path.join(output_dir, "_compute_tracker.json")
     with open(tracker_path, "w") as f:
         json.dump(global_tracker.report(), f, indent=2)
-    print(f"Stage D done. Refined captions → {args.output_dir}")
+    print(f"Stage D done. Refined captions → {output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    run(
+        flagged_dir=args.flagged_dir,
+        context_dir=args.context_dir,
+        video_folder=args.video_folder,
+        annotationfile_path=args.annotationfile_path,
+        output_dir=args.output_dir,
+        root_path=args.root_path,
+        mode=args.mode,
+    )
 
 
 if __name__ == "__main__":

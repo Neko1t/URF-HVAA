@@ -1,139 +1,363 @@
-# A Unified Reasoning Framework for Holistic Zero-Shot Video Anomaly Analysis
+# URF-HVAA — Asymmetric Dual-Pass Reflection for Video Anomaly Detection
 
-![FIGURE1](./assets/image.png)
+> A Unified Reasoning Framework for Holistic Zero-Shot Video Anomaly Analysis (NeurIPS 2025)
 
- > [Project Page](https://rathgrith.github.io/Unified_Frame_VAA/)
+[[Project Page](https://rathgrith.github.io/Unified_Frame_VAA/)] [[Paper](https://openreview.net/pdf?id=Qla5PqFL0s)]
 
+---
 
 ## Overview
 
-This is the code implementation for the paper [A Unified Reasoning Framework for Holistic Zero-Shot Video Anomaly Analysis (NeurIPS 2025)](https://openreview.net/pdf?id=Qla5PqFL0s). We thank the previous work for their excellent [codebase](https://github.com/lucazanella/lavad).
+This repository implements the **Asymmetric Dual-Pass Reflection** architecture — a training-free, zero-shot pipeline for Video Anomaly Detection (VAD), Localisation (VAL), and Understanding (VAU).
 
-## Setup
+**Core idea**: A lightweight LLM performs full-traversal reasoning to detect local-global contradictions, then guides an expensive VLM to re-examine only the suspicious frames. Like human cognition: when told "there may be a fire nearby," your eyes become sensitive to brightness, smoke, and red — rather than dismissing them as neon lights.
 
-### Environments
+### Models
 
-Simply run following commands:
+| Model | Role | VRAM |
+|-------|------|------|
+| VideoLLaMA3-7B (`DAMO-NLP-SG/VideoLLaMA3-7B`) | Visual perception (VLM) | ~15 GB |
+| Llama 3.1 8B Instruct | Text reasoning (LLM) | ~16 GB |
 
-```
+GPU requirement: single RTX 3090/4090 (24 GB). VLM and LLM are **never loaded simultaneously**.
+
+---
+
+## Quick Start
+
+### 1. Environment
+
+```bash
 conda env create -f environment.yml
 conda activate VAA
+pip install -r requirements.txt
+pip install sentence-transformers   # optional — for drift detection
 ```
 
-### Dataset
+### 2. Models
 
-We have provided preprocessed annotation files following formats in previous work (thanks to [LAVAD](https://github.com/lucazanella/lavad)) for easier setup, please download them from [Google Drive](https://drive.google.com/file/d/1jULt7PKZDTronu4eqiMwCqteKRjjVlmn/view?usp=sharing). 
-
-Before running the code, make sure you have downloaded the raw videos under ``./data/{dataset_name}/videos`` and run the provided frame extraction script to extract frames to ``./data/{dataset_name}/videos``. The final data should have structures like this.
-```
-./data/
-{dataset_name}/
-    annotations/
-    videos/
-        {video1_basename}.mp4
-        {video2_basename}.mp4
-        ...
-    frames/
-        {video1_basename}/
-            000001.jpg
-            000002.jpg
-            ...
-        {video2_basename}/
-            000001.jpg
-            000002.jpg
-            ...
-        ...
-```
-
-## Environment
-Install the Python dependencies with ``pip install -r requirements.txt``. For experiment using simplest backbone model ``VideoLLaMA3-7B, Llama3.1-8B-Instruct``, we recommend to use a machine with at least one RTX 3090 GPU.
-
-For Llama3.1-8B-Instruct model, you need to get the model checkpoint from [here](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/tree/main/original) . The checkpoint file ```consolidated.00.pth``` should have a SHA256="ab33d910f405204e5d388bc3521503584800461dc96808e287821dd451c1edac". (You can also download the file from [here](https://www.modelscope.cn/models/LLM-Research/Meta-Llama-3.1-8B-Instruct/files).) Our code assumes Llama3 repo is placed under ``./libs/``. And the ``.pth`` files for model checkpoints is placed inside the repo as ``./libs/llama/llama3.1-8b``.
-
-That is, we expect model code/files should be organized as:
+Place model files under `libs/`:
 
 ```
-./libs/
-    llama/
-        llama/
-            __init__.py
-            ...
-        llama3.1-8b/
-            consolidated.00.pth
-            params.json
-            tokenizer.model
-            ...
+libs/
+├── llama/
+│   ├── llama/             # Llama model code
+│   └── llama3.1-8b/       # consolidated.00.pth, params.json, tokenizer.model
+├── VideoLLaMA3-7B/        # VideoLLaMA3-7B checkpoint (HuggingFace format)
+└── embedder/              # sentence-transformers model (optional)
 ```
 
+Download Llama 3.1 8B checkpoint:
+- [HuggingFace](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/tree/main/original)
+- [ModelScope](https://www.modelscope.cn/models/LLM-Research/Meta-Llama-3.1-8B-Instruct/files)
+- SHA256 of `consolidated.00.pth`: `ab33d910f405204e5d388bc3521503584800461dc96808e287821dd451c1edac`
 
-
-## Video Anomaly Detection
-
-We have provided the score/caption files for reproducing main experiments in our paper, e.g., for ucf_crime, you should see:
- - Extracted video clip captions under ``./data/ucf_crime/captions/video_llama3_json_results``
- - First round scores under ``./data/ucf_crime/scores/videollama3``
- - Prompt files used for first round at ``./data/ucf_crime/scores/videollama3/context_prompt.txt`` and ``./data/ucf_crime/scores/videollama3/format_prompt.txt``
- - Extracted suspicious windows and score statistics at ``./data/ucf_crime/scores/videollama3/highest_lowest_intervals.json``.
- - Extracted anomaly tags at ``./data/ucf_crime/scores/videollama3/suspicious_part_phrases.json``
- - Refined scores under ``./data/ucf_crime/refined_scores/videollama3`` with metrics saved in a folder.
-
-Here are steps to run base experiments on the temporal Video Anomaly Detection (VAD) task.
-
-1. Precompute per-16-frame captions, call following function that produces a folder containing captions for videos. This produces the captions under the specified ``output_dir``. It takes roughly ~20 hours on a single 3090. You can skip this step by using provided precomputed caption results in ``./data/{dataset_name}/captions/videollama3_json_results/``.
+### 3. Data
 
 ```
-python ./src/video_pre_caption.py --video_folder "./data/{dataset_name}/videos/" --index_file "./data/{dataset_name}/annotations/test.txt" --output_dir "./data/{dataset_name}/captions/{experiment_name}" --interval 10
+data/{dataset}/
+├── annotations/
+│   ├── test.txt                                    # video index
+│   └── Temporal_Anomaly_Annotation_for_Testing_Videos.txt
+├── videos/           # .mp4 files (optional for text-only mode)
+├── frames/           # extracted .jpg sequences (optional)
+├── captions/         # pre-computed captions (legacy baseline)
+│   └── video_llama3_json_results/
+└── scores/           # pre-computed scores (legacy baseline)
+    └── videollama3/
 ```
 
-2. After you have the frame captions, you can run first-round scoring with Llama3.1-8B-Instruct by ``bash scripts/query_llm_vad.sh`` Note that you need to adjust the paths to make sure you are using the correct captions generated by certain VLMs. 
+Pre-computed captions and scores for UCF-Crime are available on [Google Drive](https://drive.google.com/file/d/1jULt7PKZDTronu4eqiMwCqteKRjjVlmn/view?usp=sharing).
 
-3. With the preliminary round-1 scores generated, run sliding windows to locate suspicious segments using ``python ./src/score_filter.py`` (adjust any paths inside the script to match your setup).
+### 4. Run
 
-4. Then extract anomaly tag lists by running ``python ./src/summarize_window.py``.
+```bash
+# Pre-experiment — 5 videos, ~25 min (starts from Stage C, uses pre-computed data)
+python main.py --quick-test
 
-> You can skip steps 2-4 by using pre-computed scores from ``./data/ucf_crime/scores/videollama3``.
+# Pre-experiment — full pipeline including VLM (starts from Stage A)
+python main.py --quick-test --resume-from A
 
-5. Start score refinement by running ``bash scripts/refine_score.sh``.
+# Full experiment — all videos
+python main.py
 
-6. With the refined scores, you can evaluate them by running ``bash scripts/eval_{dataset_name}.sh``.
+# Force text-only mode (skip VLM Stage D)
+python main.py --quick-test --skip-stage-d
+```
 
+---
 
-## Video Anomaly Localisation
-To run VAL task, you need to get the annotation files from a previous [work](https://github.com/xuzero/UCFCrime_BoundingBox_Annotation). We have preprocessed the file to make the frame file naming format consistent with the codebase of [LAVAD](https://github.com/lucazanella/lavad). We have provided them as an additional file called ``Test_annotation_naming_aligned.pkl``. Saved under ``./data/ucf_crime/``.
+## New Pipeline: Asymmetric Dual-Pass Reflection
 
-After you have the tag list extracted, you can run a VAL run by calling script ``python src/val_priors.py``
+### Architecture (5 Stages)
 
-We have provided localisation results under different prior tags in ``./data/ucf_crime/localisations/``.
+```
+Stage A [VLM ~15GB]   Coarse blind captioning (interval=16, max_frames=8)
+         ↓            captions/phase1_coarse/{video}.json
+Stage B [LLM ~16GB]   Initial anomaly scoring (0–1)
+         ↓            scores/phase1_initial/{video}.json
+Stage C [LLM ~16GB]   Phase 2: Sliding-window scene context memory
+                      Phase 3: Full-traversal logical conflict detection
+         ↓            context/phase2/{video}_windows.json
+         ↓            reflection/phase3_flagged/{video}.json
+Stage D [VLM ~15GB]   Targeted fine-grained verification (interval=4, max_frames=16)
+         ↓            Anti-hallucination neutral prompts
+         ↓            captions/phase4_fine/{video}.json
+Stage E [LLM ~16GB]   Context-aware re-scoring + score merge + Gaussian smoothing
+                      AUC evaluation (ROC-AUC / PR-AUC)
+                      scores/final/{video}.json
+```
 
-## Video Anomaly Understanding
+### GPU Lifecycle
 
-Before running VAU task, you need to get the [HIVAU-70K dataset](https://github.com/pipixin321/HolmesVAU). We use the value under key ``video_summary`` from ``HolmesVAU/HIVAU-70k/raw_annotations/ucf_database_test.json`` and ``HolmesVAU/HIVAU-70k/raw_annotations/xd_database_test.json`` and preprocessed them for easier use. We included the video summaries under ``video_summaries.json`` for each dataset's root file.
+Each stage explicitly cleans up GPU before returning. No two models are ever co-resident:
 
-Before you start, you may need to run ``python ./src/score_filter.py`` again for refined scores to extract final anomaly score statistics. Which is necessary for score gating.
+```
+[VLM load] → Stage A → engine.unload() → empty_cache()
+[LLM load] → Stage B → scorer.cleanup() → del + empty_cache()
+[LLM load] → Stage C → del generator → empty_cache()
+[VLM load] → Stage D → engine.unload() → empty_cache()
+[LLM load] → Stage E → del generator → empty_cache()
+```
 
-Optionally, you can draw bounding boxes for the most suspicious clips for some suspicious videos as described in InterTC steps. To do this, you can run the script: ``python src/draw_bboxes.py``, note that you need to adjust the path to have it take the UCF-crime tag list extracted previously and the finalised score statisics.
+Peak VRAM: ~16 GB. RTX 3090/4090 (24 GB) is fully sufficient.
 
-After that you can run the script to generate textual summaries for videos via ``python src/vau_priors.py``, note that you need to specify the input/output path of the priors/results. We have provided our InterTC experiment outputs along with several baselines under ``./data/{dataset_name}/understanding/``.
+### Design Principles
 
-Once you are done, you evaluate the traditional metrics via ``python src/compute_bleu.py <ground_truth.json> <predictions.json>``. For evaluating gpt-scores, you can refer to ``gpt_score_eval.py``.
+1. **Serial model loading** — GPU hosts only one model at a time
+2. **Asymmetric compute** — LLM does full traversal (cheap); VLM is on-demand (expensive)
+3. **Anti-hallucination** — Phase 4 prompts are neutral verification queries
+4. **Coarse-to-fine sampling** — interval=16 for patrol, interval=4 for focus
+5. **Context-aware final scoring** — Stage E injects scene baseline + conflict notes into LLM prompts
 
+---
 
-## Bibtex
+## `main.py` — Unified Entry Point
+
+### Usage
+
+| Command | What it does | Est. time |
+|---------|-------------|-----------|
+| `python main.py --quick-test` | 5 videos, **starts from Stage C**, uses pre-computed data | ~25 min |
+| `python main.py --quick-test --resume-from A` | 5 videos, **full pipeline** from VLM captioning | ~40–50 min |
+| `python main.py --quick-test --resume-from B` | 5 videos, from LLM scoring (needs Stage A output) | ~30 min |
+| `python main.py` | **Full experiment** — all videos, from Stage A | hours |
+| `python main.py --resume-from C` | Full experiment, skip A+B (use pre-computed data) | hours |
+| `python main.py --dataset xd_violence` | Switch dataset | — |
+
+### All CLI Arguments
+
+```
+--quick-test              Run on 5 representative videos instead of all
+--resume-from {A,B,C}     Stage to start from (default: A for full, C for quick-test)
+--dataset NAME            Dataset under data/ (default: ucf_crime)
+--output-base PATH        Override base output directory
+--skip-stage-d            Force skip VLM Stage D (text-only mode)
+--no-eval                 Skip final AUC evaluation
+--max-captions-per-context N   Max normal captions per scene context window (default: 30)
+```
+
+### Quick-test Videos
+
+| Type | Video | Frames | Duration |
+|------|-------|--------|----------|
+| Abuse | Abuse028_x264 | 1,412 | 47s |
+| Arrest | Arrest001_x264 | 2,374 | 79s |
+| Arson | Arson016_x264 | 1,795 | 60s |
+| Burglary | Burglary021_x264 | 1,537 | 51s |
+| Shooting | Shooting015_x264 | 1,713 | 57s |
+
+---
+
+## Individual Stage CLI
+
+Each stage can also run independently. All accept standard argparse arguments.
+
+### Stage A — Coarse Blind Captioning [VLM]
+
+```bash
+python src/pipeline/stage_a_coarse_caption.py \
+    --video_folder data/ucf_crime/videos \
+    --index_file data/ucf_crime/annotations/test.txt \
+    --output_dir data/ucf_crime/captions/phase1_coarse \
+    --frame_interval 16 --mode coarse
+```
+
+### Stage B — Initial Scoring [LLM]
+
+```bash
+python src/pipeline/stage_b_initial_scoring.py \
+    --root_path data/ucf_crime \
+    --annotationfile_path data/ucf_crime/annotations/test.txt \
+    --captions_dir data/ucf_crime/captions/phase1_coarse \
+    --output_dir data/ucf_crime/scores/phase1_initial \
+    --ckpt_dir libs/llama/llama3.1-8b \
+    --tokenizer_path libs/llama/llama3.1-8b/tokenizer.model
+```
+
+### Stage C — Context Memory + Conflict Detection [LLM]
+
+```bash
+python src/pipeline/stage_c_context_reflect.py \
+    --root_path data/ucf_crime \
+    --annotationfile_path data/ucf_crime/annotations/test.txt \
+    --captions_dir data/ucf_crime/captions/phase1_coarse \
+    --scores_dir data/ucf_crime/scores/phase1_initial \
+    --video_folder data/ucf_crime/videos \
+    --context_output data/ucf_crime/context/phase2 \
+    --flagged_output data/ucf_crime/reflection/phase3_flagged \
+    --ckpt_dir libs/llama/llama3.1-8b \
+    --tokenizer_path libs/llama/llama3.1-8b/tokenizer.model \
+    --max_seq_len 4096 --max_gen_len 2048
+```
+
+Key parameters: `--window_seconds 60 --stride_seconds 30 --normality_percentile 30 --cap_max_flags 20`
+
+### Stage D — Targeted Visual Verification [VLM]
+
+```bash
+python src/pipeline/stage_d_targeted_verify.py \
+    --flagged_dir data/ucf_crime/reflection/phase3_flagged \
+    --context_dir data/ucf_crime/context/phase2 \
+    --video_folder data/ucf_crime/videos \
+    --annotationfile_path data/ucf_crime/annotations/test.txt \
+    --output_dir data/ucf_crime/captions/phase4_fine \
+    --root_path data/ucf_crime
+```
+
+Skip this stage if video `.mp4` files are unavailable.
+
+### Stage E — Final Scoring + Merge + Evaluation [LLM]
+
+```bash
+python src/pipeline/stage_e_final_merge.py \
+    --root_path data/ucf_crime \
+    --annotationfile_path data/ucf_crime/annotations/test.txt \
+    --original_scores_dir data/ucf_crime/scores/phase1_initial \
+    --refined_captions_dir data/ucf_crime/captions/phase4_fine \
+    --output_dir data/ucf_crime/scores/final \
+    --ckpt_dir libs/llama/llama3.1-8b \
+    --tokenizer_path libs/llama/llama3.1-8b/tokenizer.model \
+    --context_dir data/ucf_crime/context/phase2 \
+    --flagged_dir data/ucf_crime/reflection/phase3_flagged \
+    --video_folder data/ucf_crime/videos \
+    --run_eval \
+    --temporal_annotation_file data/ucf_crime/annotations/Temporal_Anomaly_Annotation_for_Testing_Videos.txt
+```
+
+When `--context_dir` and `--flagged_dir` are provided, Stage E uses the enriched scoring prompt with scene baseline + conflict notes. Without them, it falls back to simple scoring (backward compatible).
+
+---
+
+## New Pipeline Output Structure
+
+```
+data/{dataset}/
+├── captions/
+│   ├── phase1_coarse/         # Stage A output: blind captions
+│   └── phase4_fine/           # Stage D output: refined captions (flagged frames only)
+├── scores/
+│   ├── phase1_initial/        # Stage B output: first-round scores
+│   └── final/                 # Stage E output: merged + smoothed scores
+│       └── metrics/           # ROC-AUC, PR-AUC, optimal threshold
+├── context/
+│   └── phase2/                # Stage C output: scene context windows
+└── reflection/
+    └── phase3_flagged/        # Stage C output: flagged frame lists
+```
+
+---
+
+## Original Baseline Pipeline
+
+The original pipeline scripts are preserved under `src/` for reference and backward compatibility:
+
+```bash
+# 1. VLM pre-captioning (every 16 frames)
+python src/video_pre_caption.py \
+    --video_folder data/{dataset}/videos \
+    --index_file data/{dataset}/annotations/test.txt \
+    --output_dir data/{dataset}/captions/{experiment_name} --interval 10
+
+# 2. LLM first-round scoring
+bash scripts/query_llm_vad.sh
+
+# 3. Sliding window suspicious segment extraction
+python src/score_filter.py
+
+# 4. Anomaly tag extraction
+python src/summarize_window.py
+
+# 5. Score refinement with tags
+bash scripts/refine_score.sh
+
+# 6. Evaluation
+bash scripts/eval_{dataset_name}.sh
+```
+
+These original scripts remain unchanged. The new pipeline in `src/pipeline/` replaces steps 1–6 with the 5-stage architecture.
+
+---
+
+## Module Map
+
+| New Module | Replaces (original) |
+|------------|---------------------|
+| `src/perception/vlm_engine.py` | `video_pre_caption.py`, `summarize_window.py` (VLM parts) |
+| `src/reflection/context_memory.py` | `summarize_window.py` (context logic) |
+| `src/reflection/conflict_detector.py` | `refine_with_tag.py` (new logic — contradiction detection) |
+| `src/reflection/targeted_verifier.py` | New (no equivalent in original) |
+| `src/pipeline/stage_*.py` | Orchestration (replaces shell scripts) |
+
+| Retained (unchanged) | Purpose |
+|-----------------------|---------|
+| `src/eval.py` | AUC / PR evaluation |
+| `src/score_filter.py` | Statistical interval extraction |
+| `src/val_priors.py` | VAL task |
+| `src/vau_priors.py` | VAU task |
+| `src/data/` | Data classes (`VideoRecord`, `VideoBoxes`) |
+| `src/utils/` | Utilities (paths, torch, visualization) |
+
+---
+
+## Video Anomaly Localisation (VAL)
+
+Requires [UCFCrime BoundingBox Annotation](https://github.com/xuzero/UCFCrime_BoundingBox_Annotation). We provide a preprocessed file `Test_annotation_naming_aligned.pkl` under `data/ucf_crime/`.
+
+After tag extraction, run:
+```bash
+python src/val_priors.py
+```
+
+Localisation results are under `data/ucf_crime/localisations/`.
+
+---
+
+## Video Anomaly Understanding (VAU)
+
+Requires [HIVAU-70K dataset](https://github.com/pipixin321/HolmesVAU). Video summaries have been preprocessed from `HolmesVAU/HIVAU-70k/raw_annotations/` and placed under `data/{dataset}/video_summaries.json`.
+
+```bash
+python src/vau_priors.py
+```
+
+Evaluate:
+```bash
+python src/compute_bleu.py <ground_truth.json> <predictions.json>
+python src/gpt_score_eval.py
+```
+
+---
+
+## BibTeX
 
 ```
 @inproceedings{
-lin2025AUR,
-title={A Unified Reasoning Framework for Holistic Zero-Shot Video Anomaly Analysis},
-author={Dongheng Lin, Mengxue Qu, Kunyang Han, Jianbo Jiao, Xiaojie Jin, Yunchao Wei},
-booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
-year={2025},
-url={https://openreview.net/forum?id=Qla5PqFL0s}
+    lin2025AUR,
+    title={A Unified Reasoning Framework for Holistic Zero-Shot Video Anomaly Analysis},
+    author={Dongheng Lin, Mengxue Qu, Kunyang Han, Jianbo Jiao, Xiaojie Jin, Yunchao Wei},
+    booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+    year={2025},
+    url={https://openreview.net/forum?id=Qla5PqFL0s}
 }
-
 ```
-
-
-
-
-
-
