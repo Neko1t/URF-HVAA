@@ -132,6 +132,61 @@ Peak VRAM: ~16 GB. RTX 3090/4090 (24 GB) is fully sufficient.
 
 ---
 
+## v2 Optimizations (experimental)
+
+The v2 architecture (`ARCHITECTURE_V2.md`) adds three pluggable optimizations on top of the core pipeline. All are **opt-in** — the pipeline behaves identically to v1 when not enabled.
+
+### Score Gate (`--score-gate`)
+
+A dual-threshold gate between Stage B and C that skips the reflection loop (C/D/E) for videos the LLM is already confident about:
+
+| Condition | Criteria | Action |
+|-----------|----------|--------|
+| Extremely Normal | Max_Score < 0.3 AND Variance < 0.05 | Skip reflection, output all-low scores |
+| Extremely Anomalous | Max_Score > 0.85 AND high-density > 10% | Skip reflection, keep Phase 1 raw scores |
+| Ambiguous | Everything else | Trigger Stage C → D → E |
+
+The density constraint on the Anomalous condition prevents a single VLM hallucination spike from skipping reflection.
+
+### Adversarial Verification (`--adversarial`)
+
+Upgrades Stage D from single-perspective to dual-perspective VLM verification:
+
+```
+Pass 1 (Positive): "What anomalous activity exists?"
+Pass 2 (Negative): "Why could this be a normal situation?"
+```
+
+Outputs `(positive_tag, confidence)` and `(negative_tag, confidence)` — both injected into Stage E's scoring prompt so the LLM weighs competing interpretations rather than blindly trusting one.
+
+### Interval-based Conflict Detection (`--detection-mode intervals`)
+
+Replaces full-traversal LLM conflict detection with score-continuity-based candidate intervals. Only frames within high-score regions are sent to the LLM for conflict analysis, reducing Stage C LLM calls.
+
+### Usage
+
+```bash
+# v1 baseline (no v2 features enabled)
+python main.py --quick-test
+
+# Enable Score Gate only
+python main.py --quick-test --score-gate
+
+# Enable Adversarial VLM verification
+python main.py --quick-test --adversarial
+
+# Full v2 (all optimizations)
+python main.py --quick-test --score-gate --adversarial
+
+# Ablation: Score Gate + intervals mode, no adversarial
+python main.py --quick-test --score-gate --detection-mode intervals
+
+# Full experiment with v2
+python main.py --score-gate --adversarial
+```
+
+---
+
 ## `main.py` — Unified Entry Point
 
 ### Usage
@@ -149,12 +204,17 @@ Peak VRAM: ~16 GB. RTX 3090/4090 (24 GB) is fully sufficient.
 
 ```
 --quick-test              Run on 5 representative videos instead of all
---resume-from {A,B,C}     Stage to start from (default: A for full, C for quick-test)
+--resume-from {A,B,C,D,E} Stage to start from (default: A for full, C for quick-test)
 --dataset NAME            Dataset under data/ (default: ucf_crime)
 --output-base PATH        Override base output directory
 --skip-stage-d            Force skip VLM Stage D (text-only mode)
 --no-eval                 Skip final AUC evaluation
 --max-captions-per-context N   Max normal captions per scene context window (default: 30)
+
+v2 (opt-in):
+--score-gate              Enable dual-threshold Score Gate between Stage B and C
+--adversarial             Enable dual-perspective adversarial VLM in Stage D
+--detection-mode {intervals,full}  Stage C mode: intervals (v2, lighter) or full (v1)
 ```
 
 ### Quick-test Videos
