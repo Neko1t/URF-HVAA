@@ -527,47 +527,23 @@ class VLMEngine:
                     inputs['attention_mask'] = torch.cat(
                         [inputs['attention_mask'], pad], dim=1)
 
+        sep = "=" * 60
         try:
             output_ids = self.model.generate(
                 **inputs, max_new_tokens=128, temperature=temperature
             )
-        except RuntimeError as exc:
-            err = str(exc)
-            print(f"
-{'='*60}", flush=True)
-            print(f"[VLM CRASH] {err[:120]}", flush=True)
-            print(f"{'='*60}", flush=True)
+        except RuntimeError:
+            import sys
+            print(file=sys.stderr, flush=True)
+            print(sep, file=sys.stderr, flush=True)
+            print('[VLM CRASH]', file=sys.stderr, flush=True)
             for k, v in inputs.items():
                 if hasattr(v, 'shape'):
-                    print(f"  inputs['{k}'].shape = {tuple(v.shape)}", flush=True)
-            print(f"{'='*60}
-", flush=True)
+                    print('  inputs[' + repr(k) + '].shape = ' + str(tuple(v.shape)),
+                          file=sys.stderr, flush=True)
+            print(sep, file=sys.stderr, flush=True)
             raise
 
-        return self.processor.batch_decode(
-            output_ids, skip_special_tokens=True
-        )[0]fer(self, conversation: list[dict], temperature: float = 0.1) -> str:
-        """Run a single inference pass."""
-        if not conversation:
-            return ""
-
-        inputs = self.processor(
-            conversation=conversation,
-            add_system_prompt=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
-
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                if k == "pixel_values":
-                    inputs[k] = v.to(self._device, dtype=self._float_dtype)
-                else:
-                    inputs[k] = v.to(self._device)
-
-        output_ids = self.model.generate(
-            **inputs, max_new_tokens=128, temperature=temperature
-        )
         return self.processor.batch_decode(
             output_ids, skip_special_tokens=True
         )[0]
