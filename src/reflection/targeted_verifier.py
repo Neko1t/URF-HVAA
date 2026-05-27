@@ -159,14 +159,16 @@ class TargetedVerifier:
         refined: Dict[int, str] = {}
         video_name = os.path.basename(video_path).replace(".mp4", "")
 
-        ff_iter = tqdm(flagged_frames, desc=f"  VLM verify {video_name}",
-                       unit="frame", leave=False, ncols=100) if progress \
-                  else flagged_frames
+        ff_iter = tqdm(flagged_frames, desc=f"  VLM {video_name[:12]}",
+                       unit="f", leave=False, dynamic_ncols=True,
+                       bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") \
+                  if progress else flagged_frames
 
         for ff in ff_iter:
             ctx = self._find_context(ff.frame, fps, contexts)
             if ctx is None:
-                logger.debug("Frame %d: no SceneContext covers it, skipping.", ff.frame)
+                if progress:
+                    ff_iter.set_postfix_str("skip:no ctx")
                 continue
 
             if progress:
@@ -182,7 +184,11 @@ class TargetedVerifier:
                 )
                 refined[ff.frame] = caption
                 self.tracker.phase4_vlm_calls += 1
+                if progress:
+                    ff_iter.set_postfix_str(f"f{ff.frame} ok")
             except Exception:
+                if progress:
+                    ff_iter.set_postfix_str(f"f{ff.frame} FAIL")
                 logger.warning(
                     "VLM verify skipped frame %d (model internal error, frame OK)", ff.frame,
                 )
@@ -220,14 +226,16 @@ class TargetedVerifier:
         results: Dict[int, AdversarialVerification] = {}
         video_name = os.path.basename(video_path).replace(".mp4", "")
 
-        ff_iter = tqdm(flagged_frames, desc=f"  VLM advers. {video_name}",
-                       unit="frame", leave=False, ncols=100) if progress \
-                  else flagged_frames
+        ff_iter = tqdm(flagged_frames, desc=f"  VLM adv {video_name[:12]}",
+                       unit="f", leave=False, dynamic_ncols=True,
+                       bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") \
+                  if progress else flagged_frames
 
         for ff in ff_iter:
             ctx = self._find_context(ff.frame, fps, contexts)
             if ctx is None:
-                logger.debug("Frame %d: no SceneContext, skipping.", ff.frame)
+                if progress:
+                    ff_iter.set_postfix_str("skip:no ctx")
                 continue
 
             if progress:
@@ -244,10 +252,13 @@ class TargetedVerifier:
                 if result is not None:
                     results[ff.frame] = result
                     self.tracker.phase4_vlm_calls += 2  # two VLM passes
-            except Exception:
-                logger.warning(
-                    "Adversarial verify failed for frame %d", ff.frame,
-                )
+                    if progress:
+                        ff_iter.set_postfix_str(f"f{ff.frame} ok")
+                elif progress:
+                    ff_iter.set_postfix_str(f"f{ff.frame} nil")
+            except Exception as exc:
+                if progress:
+                    ff_iter.set_postfix_str(f"f{ff.frame} FAIL")
 
         self.tracker.flagged_count = len(flagged_frames)
         return results
