@@ -494,8 +494,17 @@ class VLMEngine:
         if not conversation:
             return ""
 
+        # Conversation hardcodes "fps": 2, which is passed explicitly to
+        # load_video and would override processor.fps=None.  We must also
+        # intercept load_video to strip fps from kwargs so the None default
+        # takes effect — forcing "extract all frames + uniform downsample".
         _orig_fps = getattr(self.processor, 'fps', None)
+        _orig_load = self.processor.load_video
         self.processor.fps = None
+        def _force_uniform(**kw):
+            kw['fps'] = None
+            return _orig_load(**kw)
+        self.processor.load_video = _force_uniform
         try:
             inputs = self.processor(
                 conversation=conversation,
@@ -504,6 +513,7 @@ class VLMEngine:
                 return_tensors="pt",
             )
         finally:
+            self.processor.load_video = _orig_load
             if _orig_fps is not None:
                 self.processor.fps = _orig_fps
 
