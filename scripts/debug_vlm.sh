@@ -9,30 +9,21 @@ find . -name "*.pyc" -delete 2>/dev/null || true
 echo "Done."
 
 echo ""
-echo "=== 2. Checking vlm_engine.py for fps=None fix ==="
-if grep -q "processor.fps = None" src/perception/vlm_engine.py; then
-    echo "OK: vlm_engine.py contains fps=None fix"
+echo "=== 2. Checking vlm_engine.py for fps=4 fix ==="
+if grep -q '"fps": 4' src/perception/vlm_engine.py; then
+    echo "OK: vlm_engine.py uses fps=4 (2x oversample, deterministic)"
 else
-    echo "ERROR: vlm_engine.py does NOT contain fps=None fix"
+    echo "ERROR: vlm_engine.py does NOT use fps=4"
     exit 1
 fi
 
 echo ""
-echo "=== 3. Importing vlm_engine (same import chain as main.py) ==="
-python -c "
-import sys, inspect
-sys.path.insert(0, '.')
-from src.perception.vlm_engine import VLMEngine
-src = inspect.getsource(VLMEngine._infer)
-if 'fps = None' in src:
-    print('OK: loaded _infer has fps=None fix')
-else:
-    print('ERROR: loaded _infer is OLD version, missing fps=None fix')
-    for line in src.split('\n'):
-        s = line.strip()
-        if 'processor' in s.lower() and 'fps' in s.lower():
-            print('  line:', s)
-    exit(1)
-"
+echo "=== 3. Verifying _infer has no monkey-patch ==="
+if grep -q "_force_uniform\|_orig_load\|_orig_fps" src/perception/vlm_engine.py; then
+    echo "ERROR: _infer still contains monkey-patch code"
+    exit 1
+else
+    echo "OK: _infer is clean (no monkey-patch)"
+fi
 echo ""
 echo "=== All checks passed ==="
