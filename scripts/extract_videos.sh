@@ -43,39 +43,39 @@ skipped=0
 _extract_zip() {
     local zip="$1"
     local dir="$2"
-    # List .mp4 files inside the ZIP
-    local mp4_list
-    mp4_list=$(unzip -l "$zip" 2>/dev/null | grep -i '\.mp4$' | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/^ *//')
-    if [ -z "$mp4_list" ]; then
-        echo "    [SKIP] No .mp4 files in $(basename "$zip")"
-        return
-    fi
-    while IFS= read -r mp4_path; do
-        local fname
-        fname=$(basename "$mp4_path")
-        local dest="$dir/$fname"
-        if [ -f "$dest" ]; then
-            echo "    [SKIP] $fname already exists"
-            ((skipped+=1))
-            continue
-        fi
-        echo "    Extracting: $mp4_path"
-        unzip -o "$zip" "$mp4_path" -d "$dir" > /dev/null
-        # If the file ended up in a subdirectory, move it to the target dir
-        local extracted_path="$dir/$mp4_path"
-        if [ -f "$extracted_path" ] && [ "$extracted_path" != "$dest" ]; then
-            mv "$extracted_path" "$dest"
-            # Clean up empty subdirs
-            local subdir
-            subdir=$(dirname "$extracted_path")
-            while [ "$subdir" != "$dir" ]; do
-                rmdir "$subdir" 2>/dev/null || true
-                subdir=$(dirname "$subdir")
-            done
-        fi
-        echo "      -> $fname"
-        ((extracted+=1))
-    done <<< "$mp4_list"
+    python - "$zip" "$dir" << 'PYEOF'
+import os, sys, zipfile
+
+zf = zipfile.ZipFile(sys.argv[1], 'r')
+target = sys.argv[2]
+mp4s = [n for n in zf.namelist() if n.lower().endswith('.mp4')]
+
+if not mp4s:
+    print(f"    [SKIP] No .mp4 files in {os.path.basename(sys.argv[1])}")
+    sys.exit(0)
+
+for mp4_path in mp4s:
+    fname = os.path.basename(mp4_path)
+    dest = os.path.join(target, fname)
+    if os.path.exists(dest):
+        print(f"    [SKIP] {fname} already exists")
+        continue
+    print(f"    Extracting: {mp4_path}")
+    zf.extract(mp4_path, target)
+    extracted_path = os.path.join(target, mp4_path)
+    if os.path.exists(extracted_path) and extracted_path != dest:
+        os.rename(extracted_path, dest)
+        # Clean up empty parent dirs
+        parent = os.path.dirname(extracted_path)
+        while parent != target:
+            try:
+                os.rmdir(parent)
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
+    print(f"      -> {fname}")
+zf.close()
+PYEOF
 }
 
 # ---- Find and process archives ----
