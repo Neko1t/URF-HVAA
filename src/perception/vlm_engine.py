@@ -356,6 +356,10 @@ class VLMEngine:
         )
         pos_response = self._infer(pos_conv, temperature=0.1)
         pos_parsed = self._parse_adversarial_response(pos_response, mode="positive")
+        if not pos_parsed.get("description"):
+            import sys
+            print(f"\n[VLM RAW +] frame={frame_idx} mode={mode}", file=sys.stderr, flush=True)
+            print(repr(pos_response[:500]), file=sys.stderr, flush=True)
 
         # ---- Pass 2: negative (normal-explanation-focused) ----
         pos_tag = pos_parsed.get("tag", flagged_frame.suspicious_element)
@@ -367,6 +371,10 @@ class VLMEngine:
         )
         neg_response = self._infer(neg_conv, temperature=0.1)
         neg_parsed = self._parse_adversarial_response(neg_response, mode="negative")
+        if not neg_parsed.get("description"):
+            import sys
+            print(f"\n[VLM RAW -] frame={frame_idx} mode={mode}", file=sys.stderr, flush=True)
+            print(repr(neg_response[:500]), file=sys.stderr, flush=True)
 
         return AdversarialVerification(
             frame=frame_idx,
@@ -477,6 +485,9 @@ class VLMEngine:
                 result["tag"] = tag_m.group(1).strip()
             if conf_m:
                 result["confidence"] = int(conf_m.group(1))
+        # Fallback: if regex failed, use entire response as description
+        if not result["description"]:
+            result["description"] = response.strip()
         return result
 
     # -- internal helpers ---------------------------------------------------

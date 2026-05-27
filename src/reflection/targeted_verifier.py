@@ -158,6 +158,7 @@ class TargetedVerifier:
         """
         refined: Dict[int, str] = {}
         video_name = os.path.basename(video_path).replace(".mp4", "")
+        n_ok = n_skip = n_fail = 0
 
         ff_iter = tqdm(flagged_frames, desc=f"  VLM {video_name[:12]}",
                        unit="f", leave=False, dynamic_ncols=True,
@@ -167,8 +168,9 @@ class TargetedVerifier:
         for ff in ff_iter:
             ctx = self._find_context(ff.frame, fps, contexts)
             if ctx is None:
+                n_skip += 1
                 if progress:
-                    ff_iter.set_postfix_str("skip:no ctx")
+                    ff_iter.set_postfix_str(f"skip:{n_skip}")
                 continue
 
             if progress:
@@ -184,16 +186,20 @@ class TargetedVerifier:
                 )
                 refined[ff.frame] = caption
                 self.tracker.phase4_vlm_calls += 1
+                n_ok += 1
                 if progress:
-                    ff_iter.set_postfix_str(f"f{ff.frame} ok")
+                    ff_iter.set_postfix_str(f"ok:{n_ok}")
             except Exception:
+                n_fail += 1
                 if progress:
-                    ff_iter.set_postfix_str(f"f{ff.frame} FAIL")
+                    ff_iter.set_postfix_str(f"FAIL:{n_fail}")
                 logger.warning(
                     "VLM verify skipped frame %d (model internal error, frame OK)", ff.frame,
                 )
 
         self.tracker.flagged_count = len(flagged_frames)
+        if progress and ff_iter:
+            ff_iter.set_postfix_str(f"ok:{n_ok} skip:{n_skip} fail:{n_fail}")
         return refined
 
     def verify_frames_adversarial(
@@ -225,6 +231,7 @@ class TargetedVerifier:
         """
         results: Dict[int, AdversarialVerification] = {}
         video_name = os.path.basename(video_path).replace(".mp4", "")
+        n_ok = n_skip = n_nil = n_fail = 0
 
         ff_iter = tqdm(flagged_frames, desc=f"  VLM adv {video_name[:12]}",
                        unit="f", leave=False, dynamic_ncols=True,
@@ -234,8 +241,9 @@ class TargetedVerifier:
         for ff in ff_iter:
             ctx = self._find_context(ff.frame, fps, contexts)
             if ctx is None:
+                n_skip += 1
                 if progress:
-                    ff_iter.set_postfix_str("skip:no ctx")
+                    ff_iter.set_postfix_str(f"skip:{n_skip}")
                 continue
 
             if progress:
@@ -252,15 +260,21 @@ class TargetedVerifier:
                 if result is not None:
                     results[ff.frame] = result
                     self.tracker.phase4_vlm_calls += 2  # two VLM passes
+                    n_ok += 1
                     if progress:
-                        ff_iter.set_postfix_str(f"f{ff.frame} ok")
-                elif progress:
-                    ff_iter.set_postfix_str(f"f{ff.frame} nil")
+                        ff_iter.set_postfix_str(f"ok:{n_ok}")
+                else:
+                    n_nil += 1
+                    if progress:
+                        ff_iter.set_postfix_str(f"nil:{n_nil}")
             except Exception as exc:
+                n_fail += 1
                 if progress:
-                    ff_iter.set_postfix_str(f"f{ff.frame} FAIL")
+                    ff_iter.set_postfix_str(f"FAIL:{n_fail}")
 
         self.tracker.flagged_count = len(flagged_frames)
+        if progress and ff_iter:
+            ff_iter.set_postfix_str(f"ok:{n_ok} skip:{n_skip} nil:{n_nil} fail:{n_fail}")
         return results
 
     # -- Phase 4b: LLM rescore ----------------------------------------------
